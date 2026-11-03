@@ -1,50 +1,89 @@
 # Snail Db
 
-Snail Db is an embedded database for Snail programs, built for games, GUIs, and other
-applications with concurrent readers and writers. It stores fixed-size records under 64-bit
-keys, with support for multiple records per key, text-keyed values, name lists, and journals.
+> [!NOTE]
+> **AI disclaimer:** Snail Db's code may be used to train, fine-tune, and evaluate AI models,
+> including large language models. The copyright holder grants this in addition to the MPL 2.0,
+> and models trained on the code are not covered by the MPL.
 
-A database is a folder, and the library has no external dependencies. Point lookups are
-lock-free. Writes become visible immediately; a successful `commit()` makes them recoverable
-after a process crash. Set `sync_writes = true` for power-cut durability.
+An embedded database for Snail programs, built for games, GUIs, and other apps with concurrent
+readers and writers.
+
+- Fixed-size records under 64-bit keys, with multiple records per key, text-keyed values, name
+  lists, and journals.
+- A database is a folder. No external dependencies.
+- Lock-free point lookups.
+- Writes are visible immediately. `commit()` makes them survive a process crash;
+  `sync_writes = true` adds power-cut durability.
+
+## Performance
+
+LevelDB's [`db_bench`](https://github.com/google/leveldb#performance) suite: 1 million entries of a
+16-byte key and 100-byte value, stored as 116-byte records under a `u64` key. Every write is
+committed. Each cell is the median of three runs.
+
+All benchmarks ran on Windows 11, Intel Core i9-14900KF, 128 GB RAM, at high priority on the 16
+performance-core threads.
+
+| Write | What it does | Time | Throughput |
+|---|---|---|---|
+| fillseq | Fill a new database in key order | 0.264 µs/op | 419.0 MB/s |
+| fillsync | 1,000 writes, each flushed to the drive | 501.700 µs/op | 0.2 MB/s |
+| fillrandom | Fill a new database in random order | 0.355 µs/op | 312.0 MB/s |
+| overwrite | Write random keys into the filled database | 0.364 µs/op | 303.8 MB/s |
+
+| Read | What it does | Time | Throughput |
+|---|---|---|---|
+| readrandom | Look up random keys (86% present) | 0.164 µs/op | 6.08 M reads/s |
+| readseq | Read every entry in key order | 0.077 µs/op | 1,443.6 MB/s |
+| readreverse | Read every entry in reverse key order | 0.076 µs/op | 1,463.1 MB/s |
+| compact | Merge everything into one segment | 279.3 ms | — |
+| readrandom, compacted | Same, after `compact` | 0.434 µs/op | 2.30 M reads/s |
+| readseq, compacted | Same, after `compact` | 0.010 µs/op | 11,180.2 MB/s |
+| readreverse, compacted | Same, after `compact` | 0.008 µs/op | 13,110.7 MB/s |
+
+- Reads use the ~865,000 keys left by `overwrite`. All data fits in memory.
+- Before `compact`, everything sits in the in-memory table, which sequential reads copy and sort.
+  After, reads use one mapped segment.
 
 ## Comparisons
 
+Workload: 1 million chess positions with 1 to 3 engine evaluations each, giving 2,001,149 records
+of 64 bytes keyed by position hash. Each store keeps the deepest evaluation per engine and line.
+One run per store, process-crash-safe commits, no power-cut durability, no compression.
+
 | | Snail Db | SQLite | LMDB | libmdbx | RocksDB | LevelDB | Snail Db vs best other |
 |---|---|---|---|---|---|---|---|
-| insert 2,001,149 records, commit every 10,000 | 349 ms | 29,281 ms | 7,763 ms | 12,898 ms | 3,600 ms | 3,420 ms | **9.8x** |
-| lookup right after inserting | 276 ns | 2,857 ns | 707 ns | 857 ns | 4,527 ns | 3,116 ns | **2.6x** |
-| settle on disk | 291 ms | 24 ms | 269 ms | 472 ms | 677 ms | 1,199 ms | 0.08x |
-| lookup, key present | 556 ns | 2,827 ns | 690 ns | 845 ns | 2,832 ns | 1,650 ns | **1.2x** |
-| lookup, key absent | 22 ns | 2,437 ns | 651 ns | 751 ns | 936 ns | 1,558 ns | **29.6x** |
-| range of 100 positions | 2.4 µs | 28.2 µs | 3.6 µs | 4.4 µs | 20.7 µs | 11.0 µs | **1.5x** |
-| store one record, commit, read it back | 1.8 µs | 56.0 µs | 35.0 µs | 98.5 µs | 11.3 µs | 5.2 µs | **2.9x** |
-| 3 readers + 1 writer: reads a second | 5.06 M | 0.68 M | 4.03 M | 3.06 M | 0.68 M | 0.75 M | **1.3x** |
-| the same: writes a second | 2,483 k | 18 k | 115 k | 31 k | 449 k | 273 k | **5.5x** |
-| reopen and first lookup | 1.1 ms | 1.4 ms | 5.5 ms | 40.8 ms | 2,459.1 ms | 236.3 ms | **1.3x** |
-| size on disk | 124.5 MB | 124.1 MB | 287.2 MB | 512.0 MB | 159.8 MB | 159.2 MB | 1.00x |
+| insert 2,001,149 records, commit every 10,000 | 398 ms | 29,494 ms | 6,739 ms | 17,749 ms | 3,400 ms | 3,404 ms | **8.5x** |
+| lookup right after inserting | 284 ns | 3,097 ns | 744 ns | 863 ns | 4,450 ns | 3,210 ns | **2.6x** |
+| settle on disk | 290 ms | 24 ms | 124 ms | 473 ms | 723 ms | 977 ms | 0.08x |
+| lookup, key present | 548 ns | 3,019 ns | 747 ns | 927 ns | 2,696 ns | 1,668 ns | **1.4x** |
+| lookup, key absent | 20 ns | 2,449 ns | 697 ns | 814 ns | 897 ns | 1,451 ns | **34.4x** |
+| range of 100 positions | 2.4 µs | 33.8 µs | 3.7 µs | 5.2 µs | 20.6 µs | 10.7 µs | **1.6x** |
+| store one record, commit, read it back | 0.3 µs | 56.4 µs | 34.2 µs | 95.8 µs | 5.2 µs | 4.9 µs | **17.4x** |
+| 3 readers + 1 writer: reads a second | 4.89 M | 0.64 M | 3.90 M | 3.37 M | 0.67 M | 0.79 M | **1.3x** |
+| the same: writes a second | 3,278 k | 21 k | 118 k | 32 k | 453 k | 285 k | **7.2x** |
+| reopen and first lookup | 1.0 ms | 1.5 ms | 3.9 ms | 35.3 ms | 2,357.8 ms | 249.8 ms | **1.5x** |
+| size on disk | 125.5 MB | 124.1 MB | 287.2 MB | 512.0 MB | 159.8 MB | 159.2 MB | 0.99x |
 
 | Snail Db is ahead by | SQLite | libmdbx | RocksDB | LevelDB | LMDB |
 |---|---|---|---|---|---|
-| insert 2,001,149 records, commit every 10,000 | 83.9x | 37.0x | 10.3x | 9.8x | 22.2x |
-| lookup right after inserting | 10.4x | 3.1x | 16.4x | 11.3x | 2.6x |
-| settle on disk | 0.08x | 1.6x | 2.3x | 4.1x | 0.92x |
-| lookup, key present | 5.1x | 1.5x | 5.1x | 3.0x | 1.2x |
-| lookup, key absent | 111x | 34.1x | 42.5x | 70.8x | 29.6x |
-| range of 100 positions | 11.8x | 1.8x | 8.6x | 4.6x | 1.5x |
-| store one record, commit, read it back | 31.1x | 54.7x | 6.3x | 2.9x | 19.4x |
-| 3 readers + 1 writer: reads a second | 7.4x | 1.7x | 7.4x | 6.7x | 1.3x |
-| the same: writes a second | 138x | 80.1x | 5.5x | 9.1x | 21.6x |
-| reopen and first lookup | 1.3x | 37.1x | 2,236x | 215x | 5.0x |
-| size on disk | 1.00x | 4.1x | 1.3x | 1.3x | 2.3x |
-| **typical row** | **10.4x** | **7.5x** | **6.9x** | **6.3x** | **4.5x** |
+| insert 2,001,149 records, commit every 10,000 | 74.1x | 44.6x | 8.5x | 8.6x | 16.9x |
+| lookup right after inserting | 10.9x | 3.0x | 15.7x | 11.3x | 2.6x |
+| settle on disk | 0.08x | 1.6x | 2.5x | 3.4x | 0.43x |
+| lookup, key present | 5.5x | 1.7x | 4.9x | 3.0x | 1.4x |
+| lookup, key absent | 121x | 40.1x | 44.2x | 71.5x | 34.4x |
+| range of 100 positions | 14.3x | 2.2x | 8.7x | 4.5x | 1.6x |
+| store one record, commit, read it back | 200x | 339x | 18.5x | 17.4x | 121x |
+| 3 readers + 1 writer: reads a second | 7.7x | 1.4x | 7.3x | 6.2x | 1.3x |
+| the same: writes a second | 158x | 101x | 7.2x | 11.5x | 27.9x |
+| reopen and first lookup | 1.5x | 34.6x | 2,310x | 245x | 3.8x |
+| size on disk | 0.99x | 4.1x | 1.3x | 1.3x | 2.3x |
+| **typical row** | **13.1x** | **9.6x** | **7.8x** | **7.4x** | **5.2x** |
 
-Each column is one run of that store on Windows 11 with an Intel Core i9-14900KF and 128 GB of
-RAM. LMDB and LevelDB were rerun alone after the shared machine slowed their settle in the full run.
-The workload uses 1 million chess positions with 1 to 3 engine evaluations each: 2,001,149
-records of 64 bytes, keyed by a position hash. Each store keeps the deepest evaluation for
-each engine and line. All stores use process-crash-safe commits without power-cut durability,
-and compression is disabled.
+- **First table:** the last column compares Snail Db with the best other store in each row.
+- **Second table:** each store's result divided by Snail Db's; above 1 means Snail Db is faster or
+  smaller. Columns run from biggest lead to smallest. The typical row is the geometric mean,
+  excluding reopen, where RocksDB and LevelDB vary by seconds between runs.
 
 | Store | Configuration |
 |---|---|
@@ -56,40 +95,30 @@ and compression is disabled.
 | LevelDB 1.23 | Bloom filters; 256 MB cache; 64 MB write buffer; log sync disabled |
 
 The key-value stores use an 11-byte key (big-endian position, engine, line) and a 64-byte value.
-They read before writing to retain the deeper evaluation and use prefix seeks to retrieve a
-position's records.
+They read before writing to keep the deeper evaluation, and use prefix seeks to fetch a position's
+records.
 
-The first table's last column compares Snail Db with the best other result in each row. The second
-divides each store's result by Snail Db's, so above 1 means Snail Db is faster or smaller. Its typical
-row is the geometric mean across rows, leaving out reopen, where RocksDB and LevelDB vary by
-seconds between runs, and its columns run from Snail Db's biggest lead to its smallest.
+**Caveats**
 
-A few qualifications:
+- SQLite's 24 ms settle is a WAL checkpoint; its records are already in final form, while Snail Db
+  still flushes and merges. SQLite also runs general SQL; Snail Db offers key lookups, key ranges,
+  and scans.
+- Threaded results vary about ±25% between runs. LevelDB varied most: settle took 1.2 to 52 s and
+  reopen 151 ms to 43 s.
+- Lookups across 2 million records are bound by memory latency. With 40,000 cached records, three
+  Snail Db readers reached 15.5 M reads/s (LMDB 5.3 M, libmdbx 4.7 M) and 2.6 M writes/s (125 k,
+  82 k). Medians of three runs.
 
-- SQLite's 24 ms settle is a WAL checkpoint; its records are already in their final table
-  format. Snail Db still has to flush and merge. SQLite also supports general SQL queries;
-  Snail Db provides key lookups, key ranges, and table scans.
-- Threaded results vary by about +/-25% between runs. LevelDB varied most across five runs:
-  settling took 1.2 to 52 seconds, and reopening took 151 ms to 43 seconds, depending on log
-  replay and compaction after the concurrent workload.
-- Lookups across 2 million records are limited by memory latency. With 40,000 records that fit
-  in cache, three Snail Db readers reached 14.3 million reads/s, compared with 6.8 million for
-  LMDB and 5.1 million for libmdbx. Write throughput was 2.2 million/s, 98,000/s, and 84,000/s,
-  respectively.
+### Running the benchmarks
 
-To run the comparison from the repository root:
-
-```powershell
-python bench/fetch.py
-cd bench
-snailc build
-..\build\bench.exe
-```
-
-`fetch.py` downloads pinned sources, verifies their SHA-256 hashes, and builds LMDB, libmdbx,
-RocksDB, and LevelDB into `bench/vendor`. The benchmark accepts `[POSITIONS] [FOLDER] [STORE...]`;
-store names are `snaildb`, `sqlite`, `lmdb`, `mdbx`, `rocksdb`, and `leveldb`. The default is
-1 million positions across all stores.
+- `python bench/fetch.py` downloads pinned sources, checks their SHA-256 hashes, and builds LMDB,
+  libmdbx, RocksDB, and LevelDB into `bench/vendor`.
+- **db_bench:** `snailc build` in `bench/dbbench`, then run `build\dbbench.exe [ENTRIES] [FOLDER] [STORE...]`.
+- **Comparison:** `snailc build` in `bench`, then run `build\bench.exe [POSITIONS] [FOLDER] [STORE...]`.
+  Stores are `snaildb`, `sqlite`, `lmdb`, `mdbx`, `rocksdb`, and `leveldb`. Default: 1 million
+  positions, all stores.
+- The results above used `cmd /c start /b /wait /high /affinity FFFF <exe>`. `FFFF` selects this
+  CPU's performance cores.
 
 ## Current support
 
@@ -101,10 +130,10 @@ store names are `snaildb`, `sqlite`, `lmdb`, `mdbx`, `rocksdb`, and `leveldb`. T
 | Latest-value tables | `newest_table` replaces matching records on each put |
 | Text-keyed values | `kv` stores text keys with byte values |
 | Deletion | `remove`, `remove_key`, and `unset` |
-| Ordered reads | `range`, `each`, and `each_kv` |
+| Ordered reads | `range` and `each` in key order, `range_back` and `each_back` in reverse, and `each_kv` |
 | Name lists | Strings assigned stable numeric IDs |
 | Journals | Append-only entries with variable-length byte payloads |
-| Crash recovery | Checksummed write-ahead log, replayed on open |
+| Crash recovery | Checksummed write-ahead log, written through a memory map and replayed on open |
 | Power-cut durability | Optional disk syncs with `sync_writes = true` |
 | Write-error reporting | `commit()` returns `bool`; `error` records the first failure |
 | Segment checksums | One checksum per 64 KB of records, checked by `verify()` |
@@ -113,57 +142,23 @@ store names are `snaildb`, `sqlite`, `lmdb`, `mdbx`, `rocksdb`, and `leveldb`. T
 | Background flushing and merging | Automatic; `settle()` and `compact()` provide explicit control |
 | Setup validation | Incompatible record layouts are rejected on open; API misuse reports an error and stops |
 
-Not yet supported: group commit, separate writer locks per table, secondary indexes,
+**Not yet supported:** group commit, separate writer locks per table, secondary indexes,
 multi-process access, Linux, macOS, compression, or repair.
+
+## Usage
+
+1. Add `libs = ["C:/Snail/Snail Db/snaildb"]` to the project's `snail.toml` or `library.toml`.
+2. `use snaildb/snaildb`, register tables, key-value stores, name lists, and journals, then call
+   `open()`.
+3. Every record starts with a `u64` key. The `same` bytes right after it tell records within a key
+   apart; `same = 0` means one record per key.
+
+**Examples:** [scores.snail](examples/scores.snail) covers scores, names, and journals.
+[game.snail](examples/game.snail) adds settings, entity updates, ranges, and backup.
 
 ## API
 
-Add the library path to a project's `snail.toml` or `library.toml`:
-
-```toml
-libs = ["C:/Snail/Snail Db/snaildb"]
-```
-
-Import `snaildb/snaildb` and register tables, key-value stores, name lists, and journals before
-calling `open()`. Every table record starts with a `u64` key. The `same` bytes immediately
-after it distinguish records within that key; `same = 0` gives one record per key.
-
-```snail
-use snaildb/snaildb
-
-struct Score
-    key: u64
-    player: u32
-    points: i32
-
-fn higher(a: *u8, b: *u8) -> bool
-    return (a as *Score).points > (b as *Score).points
-
-fn main()
-    var db: Db
-    let scores = db.table("scores", sizeof(Score), 4, higher)
-    let players = db.name_list("players")
-    if not db.open("data/game")
-        print("cannot open: {db.error}")
-        db.release()
-        return
-
-    let ada = db.name_id(players, "Ada")
-    var score = Score(key: 1, player: ada, points: 120)
-    db.put(scores, &score as *u8)
-    if not db.commit()
-        print("not saved: {db.error}")
-
-    var bytes: [..]u8
-    defer bytes.free()
-    db.find(scores, 1, &bytes)    # highest score for each player at key 1
-    db.close()
-    db.release()
-```
-
-[examples/scores.snail](examples/scores.snail) covers scores, names, and journals.
-[examples/game.snail](examples/game.snail) adds settings, entity updates, ranges, and backup.
-Calls below are methods on `Db`, except for the `db_*` helpers.
+Calls are methods on `Db`, except the `db_*` helpers.
 
 ### Setup and lifecycle
 
@@ -189,6 +184,7 @@ Calls below are methods on `Db`, except for the `db_*` helpers.
 | `find(table, key, out)` | Copy the winning records for a key into a byte buffer. Order within the key is unspecified. |
 | `range(table, from, to, visit)` | Visit records in key order, including both endpoints. |
 | `each(table, visit)` | Visit all records in key order. |
+| `range_back(table, from, to, visit)` / `each_back(table, visit)` | As `range` and `each`, in descending key order. |
 
 ### Values, names, and journals
 
@@ -218,82 +214,55 @@ Calls below are methods on `Db`, except for the `db_*` helpers.
 
 ## Tests
 
-Run from `tests/`:
+- **All 17 tests:** `snailc run` in `tests/`.
+- **Selected tests:** `snailc run crash model`.
+- **Seeded model test** (repo root): `.\build\tests\store_test.exe build/tests/model-seeded model 12345`.
 
-```powershell
-snailc run
-snailc run crash model
-```
-
-The first command runs all 17 tests; the second selects two. Each test uses a fresh folder under
-`build/tests`, with its steps run as separate processes. Crash tests exit without closing the
-database. Output is checked against the corresponding `.out` file embedded in the test runner.
+Each test runs in a fresh folder under `build/tests`, with each step as a separate process. Crash
+tests exit without closing the database. Output is checked against the test's `.out` file.
 
 | Test | Coverage |
 |---|---|
 | `crash`, `better`, `remove` | Recovery of committed records, improvements, deletions, journal entries, and names after exit without closing |
 | `churn` | 300,000 keys written three times at random depths through repeated flushes and merges; checks winners, absent keys, and checksums |
-| `model`, `model-newest` | 200,000 random operations checked against a reference model, including puts, deletions, lookups, ranges, flushes, merges, compactions, and reopens |
+| `model`, `model-newest` | 200,000 random operations checked against a reference model, including puts, deletions, lookups, ranges in both directions, flushes, merges, compactions, and reopens |
 | `race`, `race-update` | Three readers validate records while a writer inserts, replaces, deletes, and re-adds records during flushing |
 | `walk` | Ordered iteration returns every winning record exactly once |
 | `fail-log`, `fail-flush`, `fail-retry` | Injected log and flush failures; checks write rejection, recovery of committed data, and flush retries |
 | `setup`, `leftovers`, `kept` | Incompatible setup and second-opener rejection, resource cleanup, crash leftovers, and preservation of unregistered tables |
 | `backup`, `kv` | Backup during writes; latest key-value data survives flushes and crash recovery |
 
-To run a model test with a specific seed from the repository root:
-
-```powershell
-.\build\tests\store_test.exe build/tests/model-seeded model 12345
-```
-
 ## Limits
 
-- **Windows only.** Other platforms need an implementation of the OS layer in `snaildb/c/db_os.h`.
-- **One open store per folder.** The `LOCK` file is opened exclusively, so a second opener fails,
-  whether it is in another process or the same one.
-- **Fixed record layouts.** Tables require a `u64` key and fixed-size records. A store supports
-  at most 255 tables, including those backing key-value stores; name lists and journals do not
-  count toward the limit. There are no secondary indexes or general query language.
-- **No transaction isolation or rollback.** Writes are visible before commit. A commit covers
-  pending writes across the database, rather than a private transaction for the calling thread.
-- **Replacement rules must be deterministic.** `better` must depend only on record contents
-  and resolve meaningful ties independently of arrival order. Use `newest_table` for latest-value
-  semantics.
-- **Writers share one lock across tables.** Disk I/O runs outside it, but `commit()` waits for
-  logging. `put()` also pauses while a flush is in progress if the live memory table reaches twice
-  `live_most`. The table being flushed is held on top of that, so memory can approach three times
-  `live_most`. `set()` and `remove()` do not pause. Group commit and separate writer locks per
-  table are not implemented.
-- **Lock-free lookups use 256 reader slots.** A thread keeps its slot from its first lookup until
-  `release()`, even after it stops reading, so only the first 256 threads to look up records are
-  lock-free; later threads fall back to a read lock. Stop all database access before calling
-  `close()`.
-- **Range reads scan in-memory records.** `range()` and `each()` copy matching records from
-  memory before merging them with disk segments. Small ranges can still scan a large memory
-  table, and the scan holds the read lock, so writers wait for it. A lower `live_most` can help
-  range-heavy workloads.
-- **Recovery requires the registered setup.** Open rejects a log containing a table the program
-  has not registered, and rejects incompatible record layouts. Segments belonging to unregistered
-  tables are preserved.
-- **No compression or repair.** Segment checksums detect corruption when `verify()` is called.
-  Opening a segment checks only its header, and normal reads do not check checksums. Automatic
-  repair is not available.
+- **Windows only.** Other platforms need an OS layer in `snaildb/c/db_os.h`.
+- **One open store per folder.** The `LOCK` file is exclusive, so a second opener fails, even in
+  the same process.
+- **Fixed record layouts.** A `u64` key and fixed-size records. At most 255 tables, counting those
+  behind key-value stores but not name lists or journals. No secondary indexes or query language.
+- **No transaction isolation or rollback.** Writes are visible before commit, and a commit covers
+  all pending writes in the database, not just the calling thread's.
+- **Replacement rules must be deterministic.** `better` must depend only on record contents and
+  break meaningful ties regardless of arrival order. Use `newest_table` for latest-value semantics.
+- **One writer lock across tables.** Disk I/O runs outside it, but `commit()` waits for logging.
+  `put()` pauses during a flush once the live table reaches 2x `live_most`, so with the table being
+  flushed, memory can approach 3x `live_most`. `set()` and `remove()` don't pause.
+- **256 lock-free reader slots.** A thread keeps its slot from its first lookup until `release()`,
+  even after it stops reading; threads past the first 256 fall back to a read lock. Stop all
+  access before `close()`.
+- **Range reads scan memory.** `range()`, `each()`, and their backward forms copy matching
+  in-memory records before merging with disk, holding the read lock so writers wait. Small ranges
+  can still scan a large memory table; a lower `live_most` helps range-heavy workloads.
+- **Recovery needs the registered setup.** Open rejects a log containing an unregistered table or
+  an incompatible record layout. Segments of unregistered tables are kept.
+- **No compression or repair.** `verify()` detects corruption with segment checksums. Opening a
+  segment checks only its header, and normal reads skip checksums.
 
 ## License
 
-Copyright (c) 2026 Angelo Wolff.
+Copyright (c) 2026 Angelo Wolff. Open source under the [Mozilla Public License 2.0](LICENSE).
 
-Snail Db is open source under the [Mozilla Public License 2.0](LICENSE). It can be used in any
-project, including closed-source and commercial games and applications. Changes made to Snail Db's
-own files must stay available under the MPL 2.0 when they are shipped.
-
-The files in `bench/vendor/leveldb`, `bench/vendor/lmdb`, `bench/vendor/mdbx`, and
-`bench/vendor/rocksdb` come from those projects and keep the licenses found in each folder.
-`bench/vendor/sqlite3.def` and `bench/vendor/sqlite3.lib` describe SQLite, which is in the public
-domain.
-
-## AI Disclaimer
-
-Snail Db's code may be used to train, fine-tune, and evaluate AI models, including large language
-models. This permission is granted by the copyright holder in addition to the MPL 2.0, and models
-trained on the code are not covered by the MPL.
+- Usable in any project, including closed-source and commercial games and apps.
+- Changes to Snail Db's own files must stay available under the MPL 2.0 when shipped.
+- `bench/vendor/leveldb`, `lmdb`, `mdbx`, and `rocksdb` come from those projects and keep the
+  licenses in each folder. `bench/vendor/sqlite3.def` and `sqlite3.lib` describe SQLite, which is
+  public domain.
