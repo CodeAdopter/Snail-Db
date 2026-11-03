@@ -249,28 +249,35 @@ To run a model test with a specific seed from the repository root:
 ## Limits
 
 - **Windows only.** Other platforms need an implementation of the OS layer in `snaildb/c/db_os.h`.
-- **One process per folder.** The `LOCK` file prevents a second opener.
+- **One open store per folder.** The `LOCK` file is opened exclusively, so a second opener fails,
+  whether it is in another process or the same one.
 - **Fixed record layouts.** Tables require a `u64` key and fixed-size records. A store supports
-  at most 255 tables, including those backing key-value stores. There are no secondary indexes
-  or general query language.
+  at most 255 tables, including those backing key-value stores; name lists and journals do not
+  count toward the limit. There are no secondary indexes or general query language.
 - **No transaction isolation or rollback.** Writes are visible before commit. A commit covers
   pending writes across the database, rather than a private transaction for the calling thread.
 - **Replacement rules must be deterministic.** `better` must depend only on record contents
   and resolve meaningful ties independently of arrival order. Use `newest_table` for latest-value
   semantics.
 - **Writers share one lock across tables.** Disk I/O runs outside it, but `commit()` waits for
-  logging. `put()` also pauses if memory reaches twice `live_most` while a flush is in progress.
-  Group commit and separate writer locks per table are not implemented.
-- **Lock-free lookup capacity is 256 threads.** Additional threads fall back to a read lock.
-  Stop all database access before calling `close()`.
+  logging. `put()` also pauses while a flush is in progress if the live memory table reaches twice
+  `live_most`. The table being flushed is held on top of that, so memory can approach three times
+  `live_most`. `set()` and `remove()` do not pause. Group commit and separate writer locks per
+  table are not implemented.
+- **Lock-free lookups use 256 reader slots.** A thread keeps its slot from its first lookup until
+  `release()`, even after it stops reading, so only the first 256 threads to look up records are
+  lock-free; later threads fall back to a read lock. Stop all database access before calling
+  `close()`.
 - **Range reads scan in-memory records.** `range()` and `each()` copy matching records from
   memory before merging them with disk segments. Small ranges can still scan a large memory
-  table; a lower `live_most` can help range-heavy workloads.
+  table, and the scan holds the read lock, so writers wait for it. A lower `live_most` can help
+  range-heavy workloads.
 - **Recovery requires the registered setup.** Open rejects a log containing a table the program
   has not registered, and rejects incompatible record layouts. Segments belonging to unregistered
   tables are preserved.
-- **No compression or repair.** Segment checksums detect corruption; automatic repair is not
-  available.
+- **No compression or repair.** Segment checksums detect corruption when `verify()` is called.
+  Opening a segment checks only its header, and normal reads do not check checksums. Automatic
+  repair is not available.
 
 ## License
 
