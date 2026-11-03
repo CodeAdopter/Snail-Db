@@ -1,0 +1,93 @@
+use snaildb/db_os
+
+struct DbNames
+    list_name: str
+    file: DbFile
+    pool: [..]u8
+    starts: [..]u32
+    slots: [..]u32
+    waiting: [..]u8
+
+    fn open(folder: str) -> bool
+        var file_path: [..]u8
+        defer file_path.free()
+        if not file.open(db_path_of(&file_path, folder, list_name, ".list"), DbOpenOrMake): return false
+        var bytes: [..]u8
+        defer bytes.free()
+        bytes.resize(file.size)
+        if not file.read_at(0, bytes.ptr, file.size): return false
+        var at: i64 = 0
+        while at + 2 <= bytes.len
+            let n = bytes[at] as i64 | (bytes[at + 1] as i64) << 8
+            if at + 2 + n > bytes.len: break
+            remember(str(bytes[at + 2..at + 2 + n]))
+            at += 2 + n
+        if at < file.size: file.cut(at)
+        return true
+
+    fn count() -> int
+        return starts.len
+
+    fn name(id: u32) -> str
+        if id == 0 or id > starts.len: return ""
+        let start = starts[id - 1]
+        let end = id < starts.len ? starts[id] : pool.len as u32
+        return str(pool[start..end])
+
+    fn id_of(s: str) -> u32
+        if slots.len == 0: return 0
+        let mask = slots.len - 1
+        var at = (db_hash(s.ptr, s.len) & mask as u64) as int
+        loop
+            let id = slots[at]
+            if id == 0: return 0
+            if name(id) == s: return id
+            at = (at + 1) & mask
+
+    fn add(s: str) -> u32
+        if s.len == 0: return 0
+        let known = id_of(s)
+        if known != 0: return known
+        let text = s.len > 65535 ? s[0..65535] : s
+        waiting.push((text.len & 255) as u8)
+        waiting.push((text.len >> 8) as u8)
+        db_add(&waiting, text)
+        return remember(text)
+
+    fn take(part: *DbPart)
+        var empty: [..]u8
+        part.bytes = waiting
+        waiting = empty
+
+    fn write(part: *DbPart, sync: bool) -> bool
+        if part.bytes.len == 0: return true
+        if not file.append(part.bytes.ptr, part.bytes.len as i64): return false
+        return not sync or file.sync()
+
+    fn remember(s: str) -> u32
+        if (starts.len + 1) * 2 > slots.len: grow()
+        starts.push(pool.len as u32)
+        db_add(&pool, s)
+        let id = starts.len as u32
+        place(id)
+        return id
+
+    fn place(id: u32)
+        let mask = slots.len - 1
+        let s = name(id)
+        var at = (db_hash(s.ptr, s.len) & mask as u64) as int
+        while slots[at] != 0: at = (at + 1) & mask
+        slots[at] = id
+
+    fn grow()
+        let room = max(slots.len * 2, 1024)
+        slots.clear()
+        slots.resize(room)
+        for i in 0..starts.len: place((i + 1) as u32)
+
+    fn close()
+        file.close()
+        pool.free()
+        starts.free()
+        slots.free()
+        waiting.free()

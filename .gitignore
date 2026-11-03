@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*.exe
+*.dll
+*.pdb
+bench/vendor/lmdb/*.lib
+bench/vendor/mdbx/*.lib
+bench/vendor/rocksdb/*.lib
+bench/vendor/leveldb/*.lib

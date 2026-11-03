@@ -1,0 +1,101 @@
+use snaildb/db_os
+
+struct DbJournal
+    name: str
+    size: int
+    data: DbFile
+    index: DbFile
+    entries: [..]u8
+    count: int
+    total: u32
+    data_end: i64
+    waiting: [..]u8
+    buffer: [..]u8
+    buffer_at: i64
+
+    fn open(folder: str) -> bool
+        var at: [..]u8
+        defer at.free()
+        if not data.open(db_path_of(&at, folder, name, ".dat"), DbOpenOrMake): return false
+        if not index.open(db_path_of(&at, folder, name, ".idx"), DbOpenOrMake)
+            data.error = index.error
+            return false
+        var n = (index.size / size) as int
+        entries.resize(n * size)
+        if n > 0 and not index.read_at(0, entries.ptr, n as i64 * size): return false
+        while n > 0 and end_of(n - 1) > data.size: n -= 1
+        entries.resize(n * size)
+        if n as i64 * size < index.size: index.cut(n as i64 * size)
+        let end = n > 0 ? end_of(n - 1) : 0
+        if end < data.size: data.cut(end)
+        count = n
+        total = n as u32
+        data_end = end
+        return true
+
+    fn entry(id: int) -> *u8
+        return &entries[id * size]
+
+    fn end_of(id: int) -> i64
+        let e = entry(id)
+        let length = (e + 8) as *u32
+        return (e as *i64)[0] + length[0] as i64
+
+    fn add(e: *u8, bytes: *u8, n: int) -> u32
+        let id = total
+        total += 1
+        if waiting.len == 0: buffer_at = data_end
+        let at = waiting.len
+        waiting.resize(at + size)
+        copy(&waiting[at], e, size)
+        let where = &waiting[at] as *i64
+        where[0] = data_end
+        let length = &waiting[at + 8] as *u32
+        length[0] = n as u32
+        data_end += n
+        let b = buffer.len
+        buffer.resize(b + n)
+        if n > 0: copy(&buffer[b], bytes, n)
+        return id
+
+    fn take(part: *DbPart)
+        var empty: [..]u8
+        var none: [..]u8
+        part.entries = waiting
+        part.bytes = buffer
+        part.at = buffer_at
+        part.first = total as i64 - waiting.len / size
+        waiting = empty
+        buffer = none
+
+    fn write(part: *DbPart, sync: bool) -> bool
+        if part.entries.len == 0: return true
+        if not data.write_at(part.at, part.bytes.ptr, part.bytes.len as i64): return false
+        if not index.write_at(part.first * size, part.entries.ptr, part.entries.len as i64)
+            data.error = index.error
+            return false
+        if sync and not (data.sync() and index.sync())
+            data.error = max(data.error, index.error)
+            return false
+        return true
+
+    fn publish(part: *DbPart)
+        if part.entries.len == 0: return
+        let at = entries.len
+        entries.resize(at + part.entries.len)
+        copy(&entries[at], part.entries.ptr, part.entries.len)
+        count += part.entries.len / size
+
+    fn close()
+        data.close()
+        index.close()
+        entries.free()
+        waiting.free()
+        buffer.free()
+        count = 0
+        total = 0
+
+struct DbEntry
+    at: i64
+    len: u32
+    spare: u32

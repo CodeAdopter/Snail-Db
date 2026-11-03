@@ -1,0 +1,1274 @@
+use snaildb/db_table
+use snaildb/db_names
+use snaildb/db_journal
+
+const DbLiveMost: i64 = 268435456
+const DbWalBatchMost = 1048576
+const DbMergeAbove = 4
+const DbWalMagic: u32 = 0x4C415753
+const DbNone: u32 = 0xFFFFFFFF
+const DbLogRemoval: u8 = 255
+
+struct Db
+    folder: [..]u8
+    guard: DbLock
+    wake: *void
+    alone: DbFile
+    tables: [..]*DbTable
+    lists: [..]*DbNames
+    journals: [..]*DbJournal
+    wal: DbFile
+    wal_batch: [..]u8
+    next_number: int = 1
+    live_most: i64 = DbLiveMost
+    sync_writes: bool
+    flusher: u64
+    merger: u64
+    flush_wanted: int
+    commit_wanted: int
+    merge_wanted: int
+    merging: int
+    flush_round: int
+    merges: int
+    flushing: int
+    pending: bool
+    closing: int
+    scanning: int
+    failed: bool
+    path: [..]u8
+    open_ok: bool
+    merge_lock: DbLock
+    turns: DbLock
+    turn_wake: *void
+    turn_next: i64
+    turn_serving: i64
+    turn_failed: bool
+    kept: [..]u8
+    kvs: [..]*DbKv
+    error_text: [..]u8
+    error_len: int
+    error_spin: int
+    readers: *u8
+    epoch: i64
+    retired: [..]DbRetired
+
+    fn file_path(name: str) -> str
+        return db_path(&path, str(folder[0..folder.len]), name)
+
+    fn table(name: str, size: int, same: int, better: extern fn(*u8, *u8) -> bool) -> *DbTable
+        if open_ok: db_misuse("make tables, name lists and journals before open")
+        if tables.len >= 255: db_misuse("a store holds at most 255 tables")
+        if size < 8: db_misuse("a record needs at least its 8 byte key")
+        if same < 0 or 8 + same > size: db_misuse("the bytes that tell records apart must fit after the key")
+        db_check_name(name)
+        for other in tables
+            if other.name == name: db_misuse("two tables share a name")
+        var t = new DbTable
+        t.setup(name, tables.len as u8, size, same, better)
+        tables.push(t)
+        return t
+
+    fn newest_table(name: str, size: int, same: int) -> *DbTable
+        let t = table(name, size, same, db_newest)
+        t.newest = true
+        return t
+
+    fn kv(name: str, most: int) -> *DbKv
+        if most < 1 or most > 65535: db_misuse("a key and its value take 1 to 65535 bytes together")
+        var k = new DbKv
+        k.table = newest_table(name, DbKvHead + most, 4)
+        k.most = most
+        kvs.push(k)
+        return k
+
+    fn set(k: *DbKv, key: str, value: []u8) -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        if key.len + value.len > k.most or key.len == 0: return false
+        var rec: [..]u8
+        defer rec.free()
+        rec.resize(k.table.size)
+        let head = rec.ptr as *u64
+        head[0] = db_key(key)
+        let lengths = (rec.ptr + 12) as *u16
+        lengths[0] = key.len as u16
+        lengths[1] = value.len as u16
+        copy(rec.ptr + DbKvHead, key.ptr, key.len)
+        if value.len > 0: copy(rec.ptr + DbKvHead + key.len, value.ptr, value.len)
+        var found: [..]u8
+        defer found.free()
+        guard.write()
+        var scratch: [..]u8
+        defer scratch.free()
+        scratch.resize(k.table.size)
+        k.table.find(head[0], &found, scratch.ptr)
+        ((rec.ptr + 8) as *u32)[0] = db_kv_slot(&found, k.table.size, key)
+        let ok = put_held(k.table, rec.ptr)
+        guard.write_done()
+        return ok or not failed
+
+    fn get(k: *DbKv, key: str, out: *[..]u8) -> bool
+        var found: [..]u8
+        defer found.free()
+        find(k.table, db_key(key), &found)
+        out.clear()
+        let size = k.table.size
+        for i in 0..found.len / size
+            let r = &found[i * size]
+            if db_kv_key(r) != key: continue
+            db_add(out, db_kv_value(r))
+            return true
+        return false
+
+    fn unset(k: *DbKv, key: str) -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        var found: [..]u8
+        defer found.free()
+        guard.write()
+        var scratch: [..]u8
+        defer scratch.free()
+        scratch.resize(k.table.size)
+        k.table.find(db_key(key), &found, scratch.ptr)
+        var removed = false
+        let size = k.table.size
+        for i in 0..found.len / size
+            let r = &found[i * size]
+            if db_kv_key(r) == key: removed = remove_held(k.table, r)
+        guard.write_done()
+        return removed
+
+    fn each_kv(k: *DbKv, visit: fn(str, []u8))
+        each(k.table, |r| visit(db_kv_key(r), db_kv_value(r) as []u8))
+
+    fn name_list(name: str) -> *DbNames
+        if open_ok: db_misuse("make tables, name lists and journals before open")
+        db_check_name(name)
+        for l in lists
+            if l.list_name == name: db_misuse("two name lists share a name")
+        var n = new DbNames
+        n.list_name = name
+        lists.push(n)
+        return n
+
+    fn journal(name: str, entry_size: int) -> *DbJournal
+        if open_ok: db_misuse("make tables, name lists and journals before open")
+        if entry_size < 12: db_misuse("a journal entry needs its first 12 bytes for where its bytes are")
+        db_check_name(name)
+        for other in journals
+            if other.name == name: db_misuse("two journals share a name")
+        var j = new DbJournal
+        j.name = name
+        j.size = entry_size
+        journals.push(j)
+        return j
+
+    fn open(at: str) -> bool
+        if open_ok: db_misuse("the store is open already")
+        folder.clear()
+        db_add(&folder, at)
+        closing = 0
+        flush_wanted = 0
+        commit_wanted = 0
+        merge_wanted = 0
+        next_number = 1
+        pending = false
+        failed = false
+        turn_failed = false
+        turn_next = 0
+        if not readers: readers = alloc[u8](DbReaders * 64)
+        if epoch == 0: epoch = 1
+        turn_serving = 0
+        error_text.clear()
+        error_len = 0
+        kept.clear()
+        wal_batch.clear()
+        sn_db_make_folder(at.ptr, at.len as int)
+        if not alone.open(file_path("LOCK"), DbAlone)
+            if alone.error == DbErrorInUse: note("the folder is in use by another program")
+            else: note_file("cannot open ", file_path("LOCK"), alone.error)
+            return shut()
+        if not read_manifest(): return shut()
+        remove_leftovers()
+        for list in lists
+            if not list.open(at)
+                var p: [..]u8
+                note_file("cannot open ", db_path_of(&p, at, list.list_name, ".list"), list.file.error)
+                p.free()
+                return shut()
+        for j in journals
+            if not j.open(at)
+                var p: [..]u8
+                note_file("cannot open ", db_path_of(&p, at, j.name, ".dat"), j.data.error)
+                p.free()
+                return shut()
+        if not replay(file_path("wal.old")) or not replay(file_path("wal")): return shut()
+        if not wal.open(file_path("wal"), DbOpenOrMake)
+            note_file("cannot open ", file_path("wal"), wal.error)
+            return shut()
+        flush_now()
+        if pending or failed: return shut()
+        if not start_wal()
+            note_file("cannot write ", file_path("wal"), wal.error)
+            return shut()
+        db_delete(file_path("wal.old"))
+        open_ok = true
+        flusher = spawn(db_flusher, self)
+        merger = spawn(db_merger, self)
+        return true
+
+    fn shut() -> bool
+        for j in journals: j.close()
+        for t in tables: t.close()
+        for list in lists: list.close()
+        wal.close()
+        alone.close()
+        kept.clear()
+        wal_batch.clear()
+        return false
+
+    fn close()
+        if not open_ok: return
+        commit()
+        guard.write()
+        closing = 1
+        sn_db_wake(&wake)
+        guard.write_done()
+        join(flusher)
+        join(merger)
+        if not failed: flush_now()
+        for r in retired: drop(r)
+        retired.clear()
+        for j in journals: j.close()
+        for t in tables: t.close()
+        for list in lists: list.close()
+        wal.close()
+        alone.close()
+        wal_batch.free()
+        kept.free()
+        open_ok = false
+
+    fn release()
+        for k in kvs: free(k)
+        kvs.free()
+        for t in tables: free(t)
+        for list in lists: free(list)
+        for j in journals: free(j)
+        tables.free()
+        lists.free()
+        journals.free()
+        folder.free()
+        path.free()
+        error_text.free()
+        retired.free()
+        if readers: free(readers)
+        readers = null
+
+    fn error() -> str
+        let n = atomic_load(&error_len)
+        return str(error_text[0..n])
+
+    fn put(t: *DbTable, rec: *u8) -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        guard.write()
+        while flushing != 0 and closing == 0 and live_bytes() >= live_most * 2: sn_db_wait(&wake, &guard.handle, 100)
+        let changed = put_held(t, rec)
+        guard.write_done()
+        return changed
+
+    fn put_held(t: *DbTable, rec: *u8) -> bool
+        if failed or not t.put(rec, 0): return false
+        log_record(t.tag, rec, t.size, false)
+        check_live()
+        return true
+
+    fn remove(t: *DbTable, rec: *u8) -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        guard.write()
+        let changed = remove_held(t, rec)
+        guard.write_done()
+        return changed
+
+    fn remove_key(t: *DbTable, key: u64) -> bool
+        if t.same != 0: db_misuse("remove_key is for tables with one record a key, others name the record")
+        var rec: [..]u8
+        defer rec.free()
+        rec.resize(t.size)
+        (rec.ptr as *u64)[0] = key
+        return remove(t, rec.ptr)
+
+    fn remove_held(t: *DbTable, rec: *u8) -> bool
+        if failed or not t.put(rec, DbDead): return false
+        log_record(t.tag, rec, t.size, true)
+        check_live()
+        return true
+
+    fn find(t: *DbTable, key: u64, out: *[..]u8)
+        if not open_ok: db_misuse("open the store before using it")
+        var small: [512]u8 = undefined
+        var big: [..]u8
+        var scratch = &small[0]
+        if t.size > 512
+            big.resize(t.size)
+            scratch = big.ptr
+        let r = sn_db_enter(readers, &epoch)
+        if r
+            t.find(key, out, scratch)
+            sn_db_leave(r)
+        else
+            guard.read()
+            t.find(key, out, scratch)
+            guard.read_done()
+        big.free()
+
+    fn retire(what: int, item: *void)
+        retired.push(DbRetired(what: what, item: item, epoch: sn_db_retire_epoch(&epoch)))
+        reclaim()
+
+    fn reclaim()
+        if retired.len == 0: return
+        let oldest = sn_db_oldest_reader(readers, &epoch)
+        var kept_at = 0
+        for i in 0..retired.len
+            let r = retired[i]
+            if r.epoch < oldest: drop(r)
+            else
+                retired[kept_at] = r
+                kept_at += 1
+        retired.resize(kept_at)
+
+    fn drop(r: DbRetired)
+        if r.what == DbRetireMem
+            let m = r.item as *DbMem
+            m.release()
+            free(m)
+        elif r.what == DbRetireView
+            let v = r.item as *DbView
+            v.list.free()
+            free(v)
+        else
+            let s = r.item as *DbSegment
+            s.close()
+            free(s)
+
+    fn records(t: *DbTable) -> i64
+        if not open_ok: db_misuse("open the store before using it")
+        guard.read()
+        let n = t.records()
+        guard.read_done()
+        return n
+
+    fn each(t: *DbTable, visit: fn(*u8))
+        range(t, 0, 0xFFFFFFFFFFFFFFFF, visit)
+
+    fn range(t: *DbTable, from: u64, to: u64, visit: fn(*u8))
+        if not open_ok: db_misuse("open the store before using it")
+        if from > to: return
+        var list: [..]*DbSegment
+        var runs: [..]DbRun
+        var held: DbCopy
+        defer list.free()
+        defer runs.free()
+        defer held.free()
+        atomic_add(&scanning, 1)
+        guard.read()
+        for s in t.segments: list.push(s)
+        t.runs_of(list[0..list.len], from, to, &runs, &held)
+        guard.read_done()
+        t.add_copies(&runs, &held)
+        var never = 0
+        t.merge(runs[0..runs.len], |r, m| visit(r), &never, true)
+        unpin()
+
+    fn verify() -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        var ok = true
+        var list: [..]*DbSegment
+        defer list.free()
+        var p: [..]u8
+        defer p.free()
+        for t in tables
+            pin(t, &list)
+            for s in list
+                if not s.verify()
+                    var text: [..]u8
+                    db_add(&text, segment_path(t, s.number, &p))
+                    db_add(&text, " is damaged")
+                    note(str(text[0..text.len]))
+                    text.free()
+                    ok = false
+            unpin()
+        return ok
+
+    fn stats(t: *DbTable) -> DbStats
+        if not open_ok: db_misuse("open the store before using it")
+        guard.read()
+        let s = DbStats(records: t.records(), segments: t.segments.len, memory: t.live.bytes + t.frozen.bytes, disk: t.disk_bytes(), written: flush_round, merges: merges)
+        guard.read_done()
+        return s
+
+    fn pin(t: *DbTable, list: *[..]*DbSegment)
+        atomic_add(&scanning, 1)
+        list.clear()
+        guard.read()
+        for s in t.segments: list.push(s)
+        guard.read_done()
+
+    fn unpin()
+        atomic_add(&scanning, -1)
+
+    fn name_id(list: *DbNames, name: str) -> u32
+        if not open_ok: db_misuse("open the store before using it")
+        guard.read()
+        let known = list.id_of(name)
+        guard.read_done()
+        if known != 0: return known
+        guard.write()
+        let id = failed ? list.id_of(name) : list.add(name)
+        guard.write_done()
+        return id
+
+    fn known_id(list: *DbNames, name: str) -> u32
+        if not open_ok: db_misuse("open the store before using it")
+        guard.read()
+        let id = list.id_of(name)
+        guard.read_done()
+        return id
+
+    fn name_of(list: *DbNames, id: u32, out: *[..]u8)
+        if not open_ok: db_misuse("open the store before using it")
+        guard.read()
+        out.clear()
+        db_add(out, list.name(id))
+        guard.read_done()
+
+    fn append(j: *DbJournal, entry: *u8, bytes: *u8, n: int) -> u32
+        if not open_ok: db_misuse("open the store before using it")
+        guard.write()
+        let id = failed ? DbNone : j.add(entry, bytes, n)
+        guard.write_done()
+        return id
+
+    fn entries(j: *DbJournal) -> int
+        if not open_ok: db_misuse("open the store before using it")
+        guard.read()
+        let n = j.count
+        guard.read_done()
+        return n
+
+    fn entry(j: *DbJournal, id: u32, out: *u8) -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        guard.read()
+        let ok = id < j.count
+        if ok: copy(out, j.entry(id as int), j.size)
+        guard.read_done()
+        return ok
+
+    fn read_entry(j: *DbJournal, id: u32, out: *u8, bytes: *[..]u8) -> bool
+        if not entry(j, id, out): return false
+        let length = (out + 8) as *u32
+        let n = length[0] as i64
+        bytes.resize(n)
+        return n == 0 or j.data.read_at((out as *i64)[0], bytes.ptr, n)
+
+    fn log_record(tag: u8, rec: *u8, size: int, removal: bool)
+        var at = wal_batch.len
+        if at == 0
+            wal_batch.resize(8)
+            at = 8
+        if removal
+            wal_batch.push(DbLogRemoval)
+            at += 1
+        wal_batch.resize(at + 1 + size)
+        wal_batch[at] = tag
+        copy(&wal_batch[at + 1], rec, size)
+
+    fn live_records() -> int
+        var n = 0
+        for t in tables: n += t.live.count
+        return n
+
+    fn live_bytes() -> i64
+        var n: i64 = 0
+        for t in tables: n += t.live.bytes
+        return n
+
+    fn waiting() -> bool
+        for j in journals
+            if j.waiting.len > 0: return true
+        for list in lists
+            if list.waiting.len > 0: return true
+        return false
+
+    fn check_live()
+        if wal_batch.len >= DbWalBatchMost and commit_wanted == 0
+            commit_wanted = 1
+            sn_db_wake(&wake)
+        if flush_wanted == 0 and live_bytes() >= live_most
+            flush_wanted = 1
+            sn_db_wake(&wake)
+
+    fn commit() -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        guard.write()
+        if failed
+            guard.write_done()
+            return false
+        if wal_batch.len == 0 and not waiting() and atomic_load(&turn_serving) == turn_next
+            guard.write_done()
+            return true
+        var c: DbCommit
+        take_commit(&c)
+        let turn = take_turn()
+        guard.write_done()
+        let ok = run_commit(turn, &c)
+        c.free()
+        return ok
+
+    fn take_commit(c: *DbCommit)
+        var empty: [..]u8
+        c.batch = wal_batch
+        wal_batch = empty
+        c.journals.resize(journals.len)
+        for i in 0..journals.len: journals[i].take(&c.journals[i])
+        c.lists.resize(lists.len)
+        for i in 0..lists.len: lists[i].take(&c.lists[i])
+
+    fn run_commit(turn: i64, c: *DbCommit) -> bool
+        turn_begin(turn)
+        let ok = write_commit(c)
+        guard.write()
+        if ok
+            for i in 0..journals.len: journals[i].publish(&c.journals[i])
+        else
+            failed = true
+        guard.write_done()
+        turn_end()
+        return ok
+
+    fn write_commit(c: *DbCommit) -> bool
+        if turn_failed: return false
+        var ok = true
+        var p: [..]u8
+        defer p.free()
+        let at = str(folder[0..folder.len])
+        for i in 0..lists.len
+            if ok and not lists[i].write(&c.lists[i], sync_writes)
+                note_file("cannot write ", db_path_of(&p, at, lists[i].list_name, ".list"), lists[i].file.error)
+                ok = false
+        for i in 0..journals.len
+            if ok and not journals[i].write(&c.journals[i], sync_writes)
+                note_file("cannot write ", db_path_of(&p, at, journals[i].name, ".dat"), journals[i].data.error)
+                ok = false
+        if ok and c.batch.len > 0 and not write_batch(&c.batch)
+            note_file("cannot write ", db_path(&p, at, "wal"), wal.error)
+            ok = false
+        if ok and c.rotate and not rotate_wal()
+            note_file("cannot start a new log in ", at, wal.error)
+            ok = false
+        if not ok: turn_failed = true
+        return ok
+
+    fn write_batch(batch: *[..]u8) -> bool
+        let n = batch.len - 8
+        let head = batch.ptr as *u32
+        head[0] = n as u32
+        head[1] = db_hash(batch.ptr + 8, n) as u32
+        if not wal.append(batch.ptr, batch.len as i64): return false
+        return not sync_writes or wal.sync()
+
+    fn take_turn() -> i64
+        let t = turn_next
+        turn_next += 1
+        return t
+
+    fn turn_begin(turn: i64)
+        turns.write()
+        while turn_serving != turn: sn_db_wait(&turn_wake, &turns.handle, 1000)
+
+    fn turn_end()
+        atomic_store(&turn_serving, turn_serving + 1)
+        sn_db_wake(&turn_wake)
+        turns.write_done()
+
+    fn start_wal() -> bool
+        if not wal.cut(0): return false
+        var text: [..]u8
+        defer text.free()
+        text.resize(8)
+        for t in tables
+            db_add(&text, t.name)
+            text.push(' ')
+            db_add_int(&text, t.size)
+            text.push('\n')
+        let head = text.ptr as *u32
+        head[0] = (text.len - 8) as u32
+        head[1] = DbWalMagic
+        return wal.append(text.ptr, text.len as i64)
+
+    fn replay(log_path: str) -> bool
+        var f: DbFile
+        if not f.open(log_path, DbRead)
+            if f.error == DbErrorMissing: return true
+            note_file("cannot read ", log_path, f.error)
+            return false
+        defer f.close()
+        var bytes: [..]u8
+        defer bytes.free()
+        bytes.resize(f.size)
+        if not f.read_at(0, bytes.ptr, f.size) or bytes.len < 8: return true
+        let first = bytes.ptr as *u32
+        if first[1] != DbWalMagic or 8 + first[0] as i64 > bytes.len: return true
+        var by_tag: [..]*DbTable
+        var sizes: [..]int
+        var names: [..]str
+        defer by_tag.free()
+        defer sizes.free()
+        defer names.free()
+        var line_start: i64 = 8
+        let names_end = 8 + first[0] as i64
+        for i in 8..names_end
+            if bytes[i] != '\n': continue
+            var words = DbWords(text: str(bytes[line_start..i]))
+            let name = words.next()
+            let size = parse_int(words.next()) as int
+            var found: *DbTable = null
+            for t in tables
+                if t.name == name and t.size == size: found = t
+            by_tag.push(found)
+            sizes.push(size)
+            names.push(name)
+            line_start = i + 1
+        var missing = -1
+        var at = names_end
+        while at + 8 <= bytes.len
+            let head = &bytes[at] as *u32
+            let n = head[0] as i64
+            if at + 8 + n > bytes.len: break
+            if db_hash(&bytes[at + 8], n) as u32 != head[1]: break
+            var p = at + 8
+            let end = p + n
+            while p < end
+                var mark: u8 = 0
+                if bytes[p] == DbLogRemoval
+                    mark = DbDead
+                    p += 1
+                let tag = bytes[p] as int
+                if tag >= sizes.len: break
+                if by_tag[tag]: by_tag[tag].put(&bytes[p + 1], mark)
+                elif missing < 0: missing = tag
+                p += 1 + sizes[tag]
+            at = end
+        if missing < 0: return true
+        var text: [..]u8
+        defer text.free()
+        db_add(&text, "the log holds records of table ")
+        db_add(&text, names[missing])
+        db_add(&text, " of ")
+        db_add_int(&text, sizes[missing])
+        db_add(&text, " bytes, which this program doesn't set up")
+        note(str(text[0..text.len]))
+        return false
+
+    fn flush_now()
+        guard.write()
+        flush_round_held()
+        guard.write_done()
+
+    fn compact(t: *DbTable)
+        if not open_ok: db_misuse("open the store before using it")
+        flush_now()
+        merge_lock.write()
+        merge_table(t, true)
+        merge_lock.write_done()
+
+    fn settle()
+        if not open_ok: db_misuse("open the store before using it")
+        flush_now()
+        guard.write()
+        while (merge_wanted != 0 or merging != 0) and closing == 0: sn_db_wait(&wake, &guard.handle, 100)
+        guard.write_done()
+
+    fn flush_round_held()
+        while flushing != 0: sn_db_wait(&wake, &guard.handle, 1000)
+        if failed: return
+        if not pending and live_records() == 0: return
+        flushing = 1
+        var c: DbCommit
+        defer c.free()
+        var turn: i64 = -1
+        if not pending
+            take_commit(&c)
+            for t in tables: t.freeze()
+            c.rotate = open_ok
+            turn = take_turn()
+        var numbers: [..]int
+        defer numbers.free()
+        for t in tables
+            numbers.push(t.frozen.count > 0 ? next_number : 0)
+            if t.frozen.count > 0: next_number += 1
+        guard.write_done()
+        var ok = turn < 0 or run_commit(turn, &c)
+        var made: [..]*DbSegment
+        defer made.free()
+        made.resize(tables.len)
+        if ok
+            for i in 0..tables.len
+                if numbers[i] > 0: made[i] = write_table(tables[i], numbers[i])
+        guard.write()
+        var all = ok
+        var any = false
+        for i in 0..tables.len
+            if made[i]
+                var old_view: *DbView = null
+                retire(DbRetireMem, tables[i].install(made[i], &old_view))
+                retire(DbRetireView, old_view)
+                any = true
+            if tables[i].frozen.count > 0: all = false
+        if ok
+            var text: [..]u8
+            defer text.free()
+            manifest_text(&text)
+            let mturn = take_turn()
+            guard.write_done()
+            turn_begin(mturn)
+            let wrote = write_manifest(&text)
+            if wrote and all and open_ok: drop_old_log()
+            turn_end()
+            guard.write()
+            all = all and wrote
+        pending = not all
+        if any
+            merge_wanted = 1
+            flush_round += 1
+        flushing = 0
+        sn_db_wake(&wake)
+
+    fn drop_old_log()
+        var p: [..]u8
+        db_delete(db_path(&p, str(folder[0..folder.len]), "wal.old"))
+        p.free()
+
+    fn rotate_wal() -> bool
+        var from: [..]u8
+        var to: [..]u8
+        defer from.free()
+        defer to.free()
+        let at = str(folder[0..folder.len])
+        wal.close()
+        if not db_rename(db_path(&from, at, "wal"), db_path(&to, at, "wal.old"))
+            wal.error = sn_db_last_error()
+            return false
+        if not wal.open(db_path(&from, at, "wal"), DbOpenOrMake): return false
+        return start_wal()
+
+    fn segment_path(table: *DbTable, number: int, out: *[..]u8) -> str
+        return db_segment_path(str(folder[0..folder.len]), table.name, number, out)
+
+    fn backup(to: str) -> bool
+        if not open_ok: db_misuse("open the store before using it")
+        commit()
+        flush_now()
+        var names: [..]str
+        var numbers: [..]int
+        var lengths: [..]i64
+        var text: [..]u8
+        defer names.free()
+        defer numbers.free()
+        defer lengths.free()
+        defer text.free()
+        atomic_add(&scanning, 1)
+        defer unpin()
+        guard.write()
+        if pending or failed
+            guard.write_done()
+            note("cannot back up while a write has failed")
+            return false
+        manifest_text(&text)
+        for t in tables
+            for s in t.segments
+                names.push(t.name)
+                numbers.push(s.number)
+        let turn = take_turn()
+        guard.write_done()
+        turn_begin(turn)
+        for list in lists: lengths.push(list.file.size)
+        for j in journals
+            lengths.push(j.data.size)
+            lengths.push(j.index.size)
+        turn_end()
+        kept_segments(&names, &numbers)
+        sn_db_make_folder(to.ptr, to.len as int)
+        let at = str(folder[0..folder.len])
+        var from: [..]u8
+        var into: [..]u8
+        defer from.free()
+        defer into.free()
+        for i in 0..names.len
+            let a = db_segment_path(at, names[i], numbers[i], &from)
+            let b = db_segment_path(to, names[i], numbers[i], &into)
+            if sn_db_link(a.ptr, a.len as int, b.ptr, b.len as int) == 0
+                note_file("cannot back up ", a, sn_db_last_error())
+                return false
+        var k = 0
+        for list in lists
+            if not backup_part(to, list.list_name, ".list", lengths[k]): return false
+            k += 1
+        for j in journals
+            if not backup_part(to, j.name, ".dat", lengths[k]) or not backup_part(to, j.name, ".idx", lengths[k + 1]): return false
+            k += 2
+        var f: DbFile
+        let m = db_path(&into, to, "MANIFEST")
+        if not f.open(m, DbCreate) or not f.append(text.ptr, text.len as i64) or not f.sync()
+            note_file("cannot write ", m, f.error)
+            f.close()
+            return false
+        f.close()
+        return true
+
+    fn backup_part(to: str, name: str, ending: str, length: i64) -> bool
+        var from: [..]u8
+        var into: [..]u8
+        defer from.free()
+        defer into.free()
+        let a = db_path_of(&from, str(folder[0..folder.len]), name, ending)
+        var error = 0
+        if db_copy_part(a, db_path_of(&into, to, name, ending), length, ref error): return true
+        note_file("cannot back up ", a, error)
+        return false
+
+    fn kept_segments(names: *[..]str, numbers: *[..]int)
+        var start = 0
+        for i in 0..kept.len
+            if kept[i] != '\n': continue
+            var words = DbWords(text: str(kept[start..i]))
+            start = i + 1
+            words.next()
+            let name = words.next()
+            words.next()
+            words.next()
+            loop
+                let w = words.next()
+                if w.len == 0: break
+                names.push(name)
+                numbers.push(parse_int(w) as int)
+
+    fn write_table(table: *DbTable, number: int) -> *DbSegment
+        var name: [..]u8
+        defer name.free()
+        let p = segment_path(table, number, &name)
+        var error = 0
+        let s = table.write_frozen(p, number, ref error)
+        if not s: note_file("cannot write ", p, error)
+        return s
+
+    fn merge_table(table: *DbTable, whole: bool)
+        var run: [..]*DbSegment
+        defer run.free()
+        var expect: i64 = 0
+        var oldest = false
+        guard.read()
+        let n = table.segments.len
+        if whole and (n > 1 or n == 1 and table.segments[0].marks)
+            for s in table.segments
+                run.push(s)
+                expect += s.count
+            oldest = true
+        elif n > DbMergeAbove
+            var total = table.segments[n - 1].count
+            var first = n - 1
+            while first > 0 and table.segments[first - 1].count <= total * 2
+                first -= 1
+                total += table.segments[first].count
+            if n - first >= 2
+                for i in first..n: run.push(table.segments[i])
+                expect = total
+                oldest = first == 0
+        guard.read_done()
+        if run.len == 0: return
+        var runs: [..]DbRun
+        defer runs.free()
+        for s in run: runs.push(s.run(0, s.count))
+        guard.write()
+        let number = next_number
+        next_number += 1
+        guard.write_done()
+        var name: [..]u8
+        defer name.free()
+        let seg_path = segment_path(table, number, &name)
+        var w: DbSegWriter
+        w.begin(seg_path, table.size, table.same, expect)
+        if not table.merge(runs[0..runs.len], |r, m| w.add(r, m), &closing, oldest)
+            w.abandon()
+            db_delete(seg_path)
+            return
+        if not w.finish()
+            note_file("cannot write ", seg_path, w.file.error)
+            db_delete(seg_path)
+            return
+        var why = DbSegOk
+        let merged = table.open_segment(seg_path, number, ref why)
+        if not merged
+            note_file("cannot read back ", seg_path, 0)
+            db_delete(seg_path)
+            return
+        loop
+            guard.write()
+            if atomic_load(&scanning) == 0: break
+            guard.write_done()
+            sleep_ms(2)
+        var first = 0
+        while table.segments[first] != run[0]: first += 1
+        var after: [..]*DbSegment
+        defer after.free()
+        for i in first + run.len..table.segments.len: after.push(table.segments[i])
+        table.segments.resize(first)
+        table.segments.push(merged)
+        for s in after: table.segments.push(s)
+        retire(DbRetireView, table.publish_view())
+        merges += 1
+        var text: [..]u8
+        defer text.free()
+        manifest_text(&text)
+        let turn = take_turn()
+        guard.write_done()
+        turn_begin(turn)
+        let wrote = write_manifest(&text)
+        turn_end()
+        var gone: [..]u8
+        defer gone.free()
+        guard.write()
+        for s in run
+            if wrote: db_delete(segment_path(table, s.number, &gone))
+            retire(DbRetireSegment, s)
+        guard.write_done()
+
+    fn manifest_text(out: *[..]u8)
+        db_add(out, "snaildb 2\nnext ")
+        db_add_int(out, next_number)
+        out.push('\n')
+        for table in tables
+            db_add(out, "table ")
+            db_add(out, table.name)
+            out.push(' ')
+            db_add_int(out, table.size)
+            out.push(' ')
+            db_add_int(out, table.same)
+            for s in table.segments
+                out.push(' ')
+                db_add_int(out, s.number)
+            out.push('\n')
+        db_add(out, str(kept[0..kept.len]))
+
+    fn write_manifest(text: *[..]u8) -> bool
+        var tmp: [..]u8
+        var final: [..]u8
+        defer tmp.free()
+        defer final.free()
+        let at = str(folder[0..folder.len])
+        let tmp_path = db_path(&tmp, at, "MANIFEST.new")
+        var f: DbFile
+        if not f.open(tmp_path, DbCreate)
+            note_file("cannot write ", tmp_path, f.error)
+            return false
+        let wrote = f.append(text.ptr, text.len as i64) and f.sync()
+        f.close()
+        if not wrote
+            note_file("cannot write ", tmp_path, f.error)
+            return false
+        if not db_rename(tmp_path, db_path(&final, at, "MANIFEST"))
+            note_file("cannot replace ", db_path(&final, at, "MANIFEST"), sn_db_last_error())
+            return false
+        return true
+
+    fn read_manifest() -> bool
+        var f: DbFile
+        if not f.open(file_path("MANIFEST"), DbRead)
+            if f.error == DbErrorMissing: return true
+            note_file("cannot read ", file_path("MANIFEST"), f.error)
+            return false
+        var text: [..]u8
+        defer text.free()
+        text.resize(f.size)
+        let read = f.read_at(0, text.ptr, f.size)
+        f.close()
+        if not read
+            note_file("cannot read ", file_path("MANIFEST"), sn_db_last_error())
+            return false
+        var seg_name: [..]u8
+        defer seg_name.free()
+        var version = 1
+        var line_start = 0
+        for i in 0..text.len
+            if text[i] != '\n': continue
+            let line = str(text[line_start..i])
+            line_start = i + 1
+            var words = DbWords(text: line)
+            let head = words.next()
+            if head == "snaildb": version = parse_int(words.next()) as int
+            if head == "next": next_number = parse_int(words.next()) as int
+            if head != "table": continue
+            let name = words.next()
+            var size = 0
+            var same = -1
+            if version >= 2
+                size = parse_int(words.next()) as int
+                same = parse_int(words.next()) as int
+            var table: *DbTable = null
+            for t in tables
+                if t.name == name: table = t
+            if not table
+                keep_line(name, size, same, words.text[words.at..words.text.len])
+                continue
+            if size > 0 and size != table.size or same >= 0 and same != table.same
+                setup_differs(table, size, same)
+                return false
+            loop
+                let w = words.next()
+                if w.len == 0: break
+                let number = parse_int(w) as int
+                let p = segment_path(table, number, &seg_name)
+                var s = new DbSegment
+                let why = s.open(p, table.size, table.same)
+                if why != DbSegOk
+                    segment_unread(table, p, why, s.file.error)
+                    free(s)
+                    return false
+                s.number = number
+                table.segments.push(s)
+        for t in tables
+            let empty = t.publish_view()
+            empty.list.free()
+            free(empty)
+        return true
+
+    fn keep_line(name: str, size: int, same: int, numbers: str)
+        db_add(&kept, "table ")
+        db_add(&kept, name)
+        kept.push(' ')
+        db_add_int(&kept, size)
+        kept.push(' ')
+        db_add_int(&kept, same)
+        db_add(&kept, numbers)
+        kept.push('\n')
+
+    fn setup_differs(table: *DbTable, size: int, same: int)
+        var text: [..]u8
+        defer text.free()
+        db_add(&text, "table ")
+        db_add(&text, table.name)
+        if size != table.size
+            db_add(&text, " holds records of ")
+            db_add_int(&text, size)
+            db_add(&text, " bytes, but this program sets it up with ")
+            db_add_int(&text, table.size)
+        else
+            db_add(&text, " tells records apart by ")
+            db_add_int(&text, same)
+            db_add(&text, " bytes after the key, but this program sets it up with ")
+            db_add_int(&text, table.same)
+        note(str(text[0..text.len]))
+
+    fn segment_unread(table: *DbTable, p: str, why: int, error: int)
+        var text: [..]u8
+        defer text.free()
+        db_add(&text, p)
+        if why == DbSegUnread and error == DbErrorMissing: db_add(&text, " is missing")
+        elif why == DbSegUnread
+            db_add(&text, " cannot be read: ")
+            db_add(&text, db_error_words(error))
+        elif why == DbSegDamaged: db_add(&text, " is damaged")
+        else
+            db_add(&text, " holds records set up another way than table ")
+            db_add(&text, table.name)
+        note(str(text[0..text.len]))
+
+    fn remove_leftovers()
+        var names: [..]u8
+        defer names.free()
+        let at = str(folder[0..folder.len])
+        if not db_list(at, &names): return
+        var p: [..]u8
+        defer p.free()
+        var start = 0
+        for i in 0..names.len
+            if names[i] != '\n': continue
+            let file = str(names[start..i])
+            start = i + 1
+            if file == "MANIFEST.new": db_delete(db_path(&p, at, file))
+            if file.len < 7 or file[file.len - 4..file.len] != ".seg": continue
+            var dash = file.len - 5
+            while dash > 0 and file[dash] != '-': dash -= 1
+            let digits = file[dash + 1..file.len - 4]
+            if dash == 0 or digits.len == 0 or not db_all_digits(digits): continue
+            if segment_named(file[0..dash], parse_int(digits) as int) == 2: db_delete(db_path(&p, at, file))
+
+    fn segment_named(name: str, number: int) -> int
+        for t in tables
+            if t.name != name: continue
+            for s in t.segments
+                if s.number == number: return 1
+            return 2
+        var start = 0
+        for i in 0..kept.len
+            if kept[i] != '\n': continue
+            var words = DbWords(text: str(kept[start..i]))
+            start = i + 1
+            words.next()
+            if words.next() != name: continue
+            words.next()
+            words.next()
+            loop
+                let w = words.next()
+                if w.len == 0: return 2
+                if parse_int(w) as int == number: return 1
+        return 0
+
+    fn note(text: str)
+        lock(&error_spin)
+        if error_len == 0 and text.len > 0
+            error_text.clear()
+            db_add(&error_text, text)
+            atomic_store(&error_len, error_text.len as int)
+        unlock(&error_spin)
+
+    fn note_file(what: str, file: str, code: int)
+        var text: [..]u8
+        defer text.free()
+        db_add(&text, what)
+        db_add(&text, file)
+        db_add(&text, ": ")
+        db_add(&text, db_error_words(code))
+        note(str(text[0..text.len]))
+
+const DbKvHead = 16
+const DbReaders = 256
+const DbRetireMem = 0
+const DbRetireView = 1
+const DbRetireSegment = 2
+
+struct DbRetired
+    what: int
+    item: *void
+    epoch: i64
+
+struct DbKv
+    table: *DbTable
+    most: int
+
+fn db_kv_key(r: *u8) -> str
+    let n = ((r + 12) as *u16)[0] as int
+    return str(r[DbKvHead..DbKvHead + n])
+
+fn db_kv_value(r: *u8) -> str
+    let lengths = (r + 12) as *u16
+    let start = DbKvHead + lengths[0] as int
+    return str(r[start..start + lengths[1] as int])
+
+fn db_kv_slot(found: *[..]u8, size: int, key: str) -> u32
+    var next: u32 = 0
+    for i in 0..found.len / size
+        let r = &found[i * size]
+        let slot = ((r + 8) as *u32)[0]
+        if db_kv_key(r) == key: return slot
+        next = max(next, slot + 1)
+    return next
+
+struct DbCommit
+    batch: [..]u8
+    journals: [..]DbPart
+    lists: [..]DbPart
+    rotate: bool
+
+    fn free()
+        batch.free()
+        for i in 0..journals.len: journals[i].free()
+        journals.free()
+        for i in 0..lists.len: lists[i].free()
+        lists.free()
+
+struct DbStats
+    records: i64
+    segments: int
+    memory: i64
+    disk: i64
+    written: int
+    merges: int
+
+fn db_flusher(db: *Db)
+    db.guard.write()
+    loop
+        if db.pending and db.closing == 0: sn_db_wait(&db.wake, &db.guard.handle, 1000)
+        while db.flush_wanted == 0 and db.commit_wanted == 0 and db.closing == 0 and not db.pending
+            sn_db_wait(&db.wake, &db.guard.handle, 1000)
+        if db.closing: break
+        db.reclaim()
+        if db.commit_wanted
+            db.commit_wanted = 0
+            db.guard.write_done()
+            db.commit()
+            db.guard.write()
+            continue
+        db.flush_wanted = 0
+        db.flush_round_held()
+    db.guard.write_done()
+
+fn db_merger(db: *Db)
+    db.guard.write()
+    loop
+        while db.merge_wanted == 0 and db.closing == 0: sn_db_wait(&db.wake, &db.guard.handle, 1000)
+        if db.closing: break
+        db.merge_wanted = 0
+        db.merging = 1
+        db.guard.write_done()
+        for t in db.tables
+            db.merge_lock.write()
+            db.merge_table(t, false)
+            db.merge_lock.write_done()
+        db.guard.write()
+        db.merging = 0
+        sn_db_wake(&db.wake)
+    db.guard.write_done()
+
+@cold
+fn db_misuse(text: str)
+    var buffer: [256]u8
+    panic(format(&buffer, "snaildb: {text}"))
+
+fn db_segment_path(folder: str, table: str, number: int, out: *[..]u8) -> str
+    out.clear()
+    db_add(out, folder)
+    out.push('/')
+    db_add(out, table)
+    out.push('-')
+    db_add_int(out, number)
+    db_add(out, ".seg")
+    out.push(0)
+    return str(out[0..out.len - 1])
+
+fn db_check_name(name: str)
+    if name.len == 0 or name.len > 200: db_misuse("a name needs 1 to 200 characters")
+    for i in 0..name.len
+        let c = name[i]
+        let ok = c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c >= '0' and c <= '9' or c == '_' or c == '-' or c == '.'
+        if not ok: db_misuse("a name keeps to letters, digits, '_', '-' and '.'")
+
+fn db_key(text: str) -> u64
+    return db_hash(text.ptr, text.len)
+
+@inline
+fn db_key2(group: u32, item: u32) -> u64
+    return (group as u64) << 32 | item as u64
+
+fn db_all_digits(s: str) -> bool
+    for i in 0..s.len
+        if s[i] < '0' or s[i] > '9': return false
+    return true
+
+struct DbWords
+    text: str
+    at: int
+
+    fn next() -> str
+        while at < text.len and text[at] == ' ': at += 1
+        let start = at
+        while at < text.len and text[at] != ' ': at += 1
+        return text[start..at]

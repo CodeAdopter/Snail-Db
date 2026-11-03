@@ -1,0 +1,7 @@
+main = "bench.snail"
+output = "../build/bench.exe"
+libs = ["../snaildb"]
+include = ["vendor", "vendor/lmdb/include", "vendor/mdbx/include", "vendor/rocksdb/include", "vendor/leveldb/include"]
+libpath = ["vendor", "vendor/lmdb", "vendor/mdbx", "vendor/rocksdb", "vendor/leveldb"]
+link = ["sqlite3", "lmdb", "mdbx", "rocksdb-shared", "leveldb"]
+copy = ["vendor/sqlite3.dll", "vendor/rocksdb/rocksdb-shared.dll", "vendor/leveldb/leveldb.dll"]

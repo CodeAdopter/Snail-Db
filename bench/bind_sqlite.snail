@@ -1,0 +1,19 @@
+extern include "sqlite3_min.h"
+extern type sqlite3
+extern type sqlite3_stmt
+extern fn sqlite3_open_v2(name: *u8, db: **sqlite3, flags: int, vfs: *u8) -> int
+extern fn sqlite3_close_v2(db: *sqlite3) -> int
+extern fn sqlite3_exec(db: *sqlite3, sql: *u8, callback: *void, arg: *void, error: *void) -> int
+extern fn sqlite3_prepare_v2(db: *sqlite3, sql: *u8, bytes: int, stmt: **sqlite3_stmt, tail: **u8) -> int
+extern fn sqlite3_bind_int64(stmt: *sqlite3_stmt, at: int, value: i64) -> int
+extern fn sqlite3_bind_blob(stmt: *sqlite3_stmt, at: int, data: *void, bytes: int, destructor: *void) -> int
+extern fn sqlite3_step(stmt: *sqlite3_stmt) -> int
+extern fn sqlite3_reset(stmt: *sqlite3_stmt) -> int
+extern fn sqlite3_column_int64(stmt: *sqlite3_stmt, column: int) -> i64
+extern fn sqlite3_finalize(stmt: *sqlite3_stmt) -> int
+extern fn sqlite3_errmsg(db: *sqlite3) -> cstr
+extern fn sqlite3_libversion() -> cstr
+extern fn sqlite3_initialize() -> int
+
+const SqlRow = 100
+const SqlOpen = 0x2 | 0x4 | 0x8000

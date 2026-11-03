@@ -1,0 +1,18 @@
+rocksdb 11.12, installed by bench/fetch.py
+recipe: d5798d968941bc8a
+source: https://github.com/facebook/rocksdb/archive/refs/tags/v11.12.tar.gz
+sha256: d8a9d46f9182b47a8d4611c351d622518b1890b9e4e150d81478ab2f45ecd340
+built: 2026-11-03T06:08:09+02:00
+compiler: Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36257 for x64 (toolset 14.51.36231)
+build: cmake version 4.3.1-msvc1, Ninja, target rocksdb-shared
+cmake: -DCMAKE_BUILD_TYPE=Release -DROCKSDB_BUILD_SHARED=ON -DWITH_MD_LIBRARY=OFF -DWITH_RUNTIME_DEBUG=OFF -DPORTABLE=0 -DFAIL_ON_WARNINGS=OFF -DROCKSDB_SKIP_THIRDPARTY=ON -DWITH_GFLAGS=OFF -DWITH_SNAPPY=OFF -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_XPRESS=OFF -DWITH_JEMALLOC=OFF -DWITH_LIBURING=OFF -DWITH_NUMA=OFF -DUSE_FOLLY=OFF -DUSE_FOLLY_LITE=OFF -DUSE_COROUTINES=OFF -DWITH_TESTS=OFF -DWITH_ALL_TESTS=OFF -DWITH_TOOLS=OFF -DWITH_CORE_TOOLS=OFF -DWITH_BENCHMARK_TOOLS=OFF -DWITH_TRACE_TOOLS=OFF -DWITH_BENCHMARK=OFF -DWITH_EXAMPLES=OFF -DWITH_JNI=OFF
+kind: DLL exporting the C API, C runtime linked in (/MT)
+exports: 1768 rocksdb_* C functions of 1768 names, including the 54 bench/bind_rocksdb.snail declares
+imports: SHLWAPI.dll, RPCRT4.dll, KERNEL32.dll
+files:
+  COPYING 18092 bytes
+  LICENSE.Apache 11358 bytes
+  LICENSE.leveldb 1572 bytes
+  include/rocksdb/c.h 297746 bytes
+  rocksdb-shared.dll 15925760 bytes
+  rocksdb-shared.lib 608470 bytes

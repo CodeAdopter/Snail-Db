@@ -1,0 +1,65 @@
+extern include "leveldb/c.h"
+
+extern type leveldb_t
+extern type leveldb_options_t
+extern type leveldb_cache_t
+extern type leveldb_filterpolicy_t
+extern type leveldb_readoptions_t
+extern type leveldb_writeoptions_t
+extern type leveldb_writebatch_t
+extern type leveldb_iterator_t
+
+extern const leveldb_no_compression: int = 0
+extern const leveldb_snappy_compression: int = 1
+
+extern fn leveldb_major_version() -> int
+extern fn leveldb_minor_version() -> int
+
+extern fn leveldb_free(ptr: *void)
+extern "leveldb_free" fn leveldb_free_text(text: cstr)
+
+extern fn leveldb_options_create() -> *leveldb_options_t
+extern fn leveldb_options_destroy(options: *leveldb_options_t)
+extern fn leveldb_options_set_create_if_missing(options: *leveldb_options_t, v: u8)
+extern fn leveldb_options_set_write_buffer_size(options: *leveldb_options_t, size: u64)
+extern fn leveldb_options_set_max_open_files(options: *leveldb_options_t, n: int)
+extern fn leveldb_options_set_max_file_size(options: *leveldb_options_t, size: u64)
+extern fn leveldb_options_set_block_size(options: *leveldb_options_t, size: u64)
+extern fn leveldb_options_set_compression(options: *leveldb_options_t, compression: int)
+extern fn leveldb_options_set_cache(options: *leveldb_options_t, cache: *leveldb_cache_t)
+extern fn leveldb_options_set_filter_policy(options: *leveldb_options_t, policy: *leveldb_filterpolicy_t)
+extern fn leveldb_cache_create_lru(capacity: u64) -> *leveldb_cache_t
+extern fn leveldb_cache_destroy(cache: *leveldb_cache_t)
+extern fn leveldb_filterpolicy_create_bloom(bits_per_key: int) -> *leveldb_filterpolicy_t
+extern fn leveldb_filterpolicy_destroy(policy: *leveldb_filterpolicy_t)
+
+extern fn leveldb_open(options: *leveldb_options_t, name: *u8, errptr: *cstr) -> *leveldb_t
+extern fn leveldb_close(db: *leveldb_t)
+extern fn leveldb_destroy_db(options: *leveldb_options_t, name: *u8, errptr: *cstr)
+extern fn leveldb_put(db: *leveldb_t, options: *leveldb_writeoptions_t, key: *u8, keylen: u64, val: *u8, vallen: u64, errptr: *cstr)
+extern fn leveldb_get(db: *leveldb_t, options: *leveldb_readoptions_t, key: *u8, keylen: u64, vallen: *u64, errptr: *cstr) -> *u8
+extern fn leveldb_write(db: *leveldb_t, options: *leveldb_writeoptions_t, batch: *leveldb_writebatch_t, errptr: *cstr)
+extern fn leveldb_compact_range(db: *leveldb_t, start_key: *u8, start_key_len: u64, limit_key: *u8, limit_key_len: u64)
+extern fn leveldb_property_value(db: *leveldb_t, propname: *u8) -> cstr
+
+extern fn leveldb_writebatch_create() -> *leveldb_writebatch_t
+extern fn leveldb_writebatch_put(batch: *leveldb_writebatch_t, key: *u8, klen: u64, val: *u8, vlen: u64)
+extern fn leveldb_writebatch_clear(batch: *leveldb_writebatch_t)
+extern fn leveldb_writebatch_destroy(batch: *leveldb_writebatch_t)
+
+extern fn leveldb_readoptions_create() -> *leveldb_readoptions_t
+extern fn leveldb_readoptions_destroy(options: *leveldb_readoptions_t)
+extern fn leveldb_readoptions_set_verify_checksums(options: *leveldb_readoptions_t, v: u8)
+extern fn leveldb_readoptions_set_fill_cache(options: *leveldb_readoptions_t, v: u8)
+extern fn leveldb_writeoptions_create() -> *leveldb_writeoptions_t
+extern fn leveldb_writeoptions_destroy(options: *leveldb_writeoptions_t)
+extern fn leveldb_writeoptions_set_sync(options: *leveldb_writeoptions_t, v: u8)
+
+extern fn leveldb_create_iterator(db: *leveldb_t, options: *leveldb_readoptions_t) -> *leveldb_iterator_t
+extern fn leveldb_iter_seek(it: *leveldb_iterator_t, k: *u8, klen: u64)
+extern fn leveldb_iter_valid(it: *leveldb_iterator_t) -> u8
+extern fn leveldb_iter_key(it: *leveldb_iterator_t, klen: *u64) -> *u8
+extern fn leveldb_iter_value(it: *leveldb_iterator_t, vlen: *u64) -> *u8
+extern fn leveldb_iter_next(it: *leveldb_iterator_t)
+extern fn leveldb_iter_get_error(it: *leveldb_iterator_t, errptr: *cstr)
+extern fn leveldb_iter_destroy(it: *leveldb_iterator_t)

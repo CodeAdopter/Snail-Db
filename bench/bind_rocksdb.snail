@@ -1,0 +1,89 @@
+extern include "rocksdb/c.h"
+
+extern type rocksdb_t
+extern type rocksdb_options_t
+extern type rocksdb_block_based_table_options_t
+extern type rocksdb_cache_t
+extern type rocksdb_filterpolicy_t
+extern type rocksdb_readoptions_t
+extern type rocksdb_writeoptions_t
+extern type rocksdb_flushoptions_t
+extern type rocksdb_writebatch_t
+extern type rocksdb_iterator_t
+
+extern const rocksdb_no_compression: int = 0
+extern const rocksdb_snappy_compression: int = 1
+extern const rocksdb_zlib_compression: int = 2
+extern const rocksdb_bz2_compression: int = 3
+extern const rocksdb_lz4_compression: int = 4
+extern const rocksdb_lz4hc_compression: int = 5
+extern const rocksdb_xpress_compression: int = 6
+extern const rocksdb_zstd_compression: int = 7
+
+extern fn rocksdb_free(ptr: *void)
+extern "rocksdb_free" fn rocksdb_free_text(text: cstr)
+
+extern fn rocksdb_options_create() -> *rocksdb_options_t
+extern fn rocksdb_options_destroy(options: *rocksdb_options_t)
+extern fn rocksdb_options_set_create_if_missing(options: *rocksdb_options_t, v: u8)
+extern fn rocksdb_options_increase_parallelism(options: *rocksdb_options_t, total_threads: int)
+extern fn rocksdb_options_optimize_level_style_compaction(options: *rocksdb_options_t, memtable_memory_budget: u64)
+extern fn rocksdb_options_set_write_buffer_size(options: *rocksdb_options_t, size: u64)
+extern fn rocksdb_options_set_max_write_buffer_number(options: *rocksdb_options_t, n: int)
+extern fn rocksdb_options_set_max_background_jobs(options: *rocksdb_options_t, n: int)
+extern fn rocksdb_options_set_max_open_files(options: *rocksdb_options_t, n: int)
+extern fn rocksdb_options_set_compression(options: *rocksdb_options_t, compression: int)
+extern fn rocksdb_options_set_block_based_table_factory(options: *rocksdb_options_t, table_options: *rocksdb_block_based_table_options_t)
+
+extern fn rocksdb_block_based_options_create() -> *rocksdb_block_based_table_options_t
+extern fn rocksdb_block_based_options_destroy(options: *rocksdb_block_based_table_options_t)
+extern fn rocksdb_block_based_options_set_block_cache(options: *rocksdb_block_based_table_options_t, cache: *rocksdb_cache_t)
+extern fn rocksdb_block_based_options_set_filter_policy(options: *rocksdb_block_based_table_options_t, policy: *rocksdb_filterpolicy_t)
+extern fn rocksdb_block_based_options_set_block_size(options: *rocksdb_block_based_table_options_t, size: u64)
+extern fn rocksdb_block_based_options_set_cache_index_and_filter_blocks(options: *rocksdb_block_based_table_options_t, v: u8)
+extern fn rocksdb_cache_create_lru(capacity: u64) -> *rocksdb_cache_t
+extern fn rocksdb_cache_destroy(cache: *rocksdb_cache_t)
+extern fn rocksdb_filterpolicy_create_bloom(bits_per_key: f64) -> *rocksdb_filterpolicy_t
+
+extern fn rocksdb_open(options: *rocksdb_options_t, name: *u8, errptr: *cstr) -> *rocksdb_t
+extern fn rocksdb_close(db: *rocksdb_t)
+extern fn rocksdb_destroy_db(options: *rocksdb_options_t, name: *u8, errptr: *cstr)
+extern fn rocksdb_put(db: *rocksdb_t, options: *rocksdb_writeoptions_t, key: *u8, keylen: u64, val: *u8, vallen: u64, errptr: *cstr)
+extern fn rocksdb_get(db: *rocksdb_t, options: *rocksdb_readoptions_t, key: *u8, keylen: u64, vallen: *u64, errptr: *cstr) -> *u8
+extern fn rocksdb_write(db: *rocksdb_t, options: *rocksdb_writeoptions_t, batch: *rocksdb_writebatch_t, errptr: *cstr)
+extern fn rocksdb_flush(db: *rocksdb_t, options: *rocksdb_flushoptions_t, errptr: *cstr)
+extern fn rocksdb_compact_range(db: *rocksdb_t, start_key: *u8, start_key_len: u64, limit_key: *u8, limit_key_len: u64)
+extern fn rocksdb_property_value(db: *rocksdb_t, propname: *u8) -> cstr
+
+extern fn rocksdb_writebatch_create() -> *rocksdb_writebatch_t
+extern fn rocksdb_writebatch_put(batch: *rocksdb_writebatch_t, key: *u8, klen: u64, val: *u8, vlen: u64)
+extern fn rocksdb_writebatch_clear(batch: *rocksdb_writebatch_t)
+extern fn rocksdb_writebatch_count(batch: *rocksdb_writebatch_t) -> int
+extern fn rocksdb_writebatch_destroy(batch: *rocksdb_writebatch_t)
+
+extern fn rocksdb_readoptions_create() -> *rocksdb_readoptions_t
+extern fn rocksdb_readoptions_destroy(options: *rocksdb_readoptions_t)
+extern fn rocksdb_readoptions_set_verify_checksums(options: *rocksdb_readoptions_t, v: u8)
+extern fn rocksdb_readoptions_set_fill_cache(options: *rocksdb_readoptions_t, v: u8)
+extern fn rocksdb_writeoptions_create() -> *rocksdb_writeoptions_t
+extern fn rocksdb_writeoptions_destroy(options: *rocksdb_writeoptions_t)
+extern fn rocksdb_writeoptions_set_sync(options: *rocksdb_writeoptions_t, v: u8)
+extern fn rocksdb_writeoptions_disable_WAL(options: *rocksdb_writeoptions_t, disable: int)
+extern fn rocksdb_flushoptions_create() -> *rocksdb_flushoptions_t
+extern fn rocksdb_flushoptions_destroy(options: *rocksdb_flushoptions_t)
+extern fn rocksdb_flushoptions_set_wait(options: *rocksdb_flushoptions_t, v: u8)
+
+extern fn rocksdb_create_iterator(db: *rocksdb_t, options: *rocksdb_readoptions_t) -> *rocksdb_iterator_t
+extern fn rocksdb_iter_seek(it: *rocksdb_iterator_t, k: *u8, klen: u64)
+extern fn rocksdb_iter_valid(it: *rocksdb_iterator_t) -> u8
+extern fn rocksdb_iter_key(it: *rocksdb_iterator_t, klen: *u64) -> *u8
+extern fn rocksdb_iter_value(it: *rocksdb_iterator_t, vlen: *u64) -> *u8
+extern fn rocksdb_iter_next(it: *rocksdb_iterator_t)
+extern fn rocksdb_iter_get_error(it: *rocksdb_iterator_t, errptr: *cstr)
+extern fn rocksdb_iter_destroy(it: *rocksdb_iterator_t)
+
+extern type rocksdb_slicetransform_t
+extern fn rocksdb_slicetransform_create_fixed_prefix(len: u64) -> *rocksdb_slicetransform_t
+extern fn rocksdb_options_set_prefix_extractor(options: *rocksdb_options_t, transform: *rocksdb_slicetransform_t)
+extern fn rocksdb_readoptions_set_prefix_same_as_start(options: *rocksdb_readoptions_t, v: u8)
+extern fn rocksdb_readoptions_set_total_order_seek(options: *rocksdb_readoptions_t, v: u8)

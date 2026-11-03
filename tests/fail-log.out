@@ -1,0 +1,4 @@
+commit true
+commit after a failed write false, says the log is full true
+takes writes after false, still reads 1010
+found 1000 committed, error after opening ''

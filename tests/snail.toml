@@ -1,0 +1,4 @@
+main = "store_test.snail"
+output = "../build/tests/store_test.exe"
+libs = ["../snaildb"]
+include = ["c"]

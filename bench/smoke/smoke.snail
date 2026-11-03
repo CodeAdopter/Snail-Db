@@ -1,0 +1,367 @@
+use ../bind_lmdb
+use ../bind_mdbx
+use ../bind_rocksdb
+use ../bind_leveldb
+
+extern include "direct.h"
+extern fn _mkdir(path: *u8) -> int
+extern fn remove(path: *u8) -> int
+extern fn memcmp(a: *void, b: *void, count: u64) -> int
+extern type FILE
+extern fn fopen(path: *u8, mode: *u8) -> *FILE
+extern fn _fseeki64(file: *FILE, offset: i64, origin: int) -> int
+extern fn _ftelli64(file: *FILE) -> i64
+extern fn fclose(file: *FILE) -> int
+
+const KeyBytes = 11
+const ValueBytes = 64
+const Count = 11
+const Prefix = "smk/"
+const Group = 'k'
+const InGroup = 5
+
+struct Record
+    key: [KeyBytes]u8
+    value: [ValueBytes]u8
+
+var records: [Count]Record
+
+fn record(group: u8, n: int) -> Record
+    var r: Record
+    r.key[0] = 's'
+    r.key[1] = 'm'
+    r.key[2] = group
+    r.key[3] = '/'
+    var v = n
+    var i = KeyBytes - 1
+    while i >= 4
+        r.key[i] = ('0' + v % 10) as u8
+        v = v / 10
+        i -= 1
+    for j in 0..ValueBytes: r.value[j] = (r.key[j % KeyBytes] * 7 + j * 13) as u8
+    return r
+
+fn fill()
+    var at = 0
+    for n in 0..3
+        records[at] = record('l', n)
+        at += 1
+    for n in 0..InGroup
+        records[at] = record(Group, InGroup - 1 - n)
+        at += 1
+    for n in 0..3
+        records[at] = record('j', n)
+        at += 1
+
+fn is_nth(n: int, key: *void, key_len: u64, value: *void, value_len: u64) -> bool
+    var want = record(Group, n)
+    if key_len != KeyBytes or value_len != ValueBytes: return false
+    return memcmp(key, &want.key[0], KeyBytes) == 0 and memcmp(value, &want.value[0], ValueBytes) == 0
+
+fn has_prefix(key: *void, key_len: u64) -> bool
+    return key_len == KeyBytes and memcmp(key, Prefix.ptr, Prefix.len) == 0
+
+fn file_size(path: str) -> i64
+    let f = fopen(path.ptr, "rb".ptr)
+    if not f: return -1
+    _fseeki64(f, 0, 2)
+    let n = _ftelli64(f)
+    fclose(f)
+    return n
+
+fn fail(store: str, what: str, why: str) -> bool
+    print("FAIL {store}: {what}: {why}")
+    return false
+
+fn lmdb_ok(rc: int, what: str) -> bool
+    if rc == MDB_SUCCESS: return true
+    return fail("lmdb", what, str(mdb_strerror(rc)))
+
+fn smoke_lmdb(base: str) -> bool
+    var path_buffer: [1024]u8
+    var file_buffer: [1100]u8
+    let path = format(&path_buffer, "{base}/lmdb")
+    remove(format(&file_buffer, "{path}/data.mdb").ptr)
+    remove(format(&file_buffer, "{path}/lock.mdb").ptr)
+    _mkdir(path.ptr)
+
+    var env: *MDB_env
+    if not lmdb_ok(mdb_env_create(&env), "env_create"): return false
+    if not lmdb_ok(mdb_env_set_mapsize(env, 1 << 30), "env_set_mapsize"): return false
+    if not lmdb_ok(mdb_env_set_maxreaders(env, 64), "env_set_maxreaders"): return false
+    if not lmdb_ok(mdb_env_open(env, path.ptr, MDB_NOTLS | MDB_NOSYNC | MDB_NOMETASYNC, 0x1A4), "env_open"): return false
+
+    var txn: *MDB_txn
+    var dbi: MDB_dbi
+    if not lmdb_ok(mdb_txn_begin(env, null, 0, &txn), "txn_begin"): return false
+    if not lmdb_ok(mdb_dbi_open(txn, null, MDB_CREATE, &dbi), "dbi_open"): return false
+    for i in 0..Count
+        var k = MDB_val(mv_size: KeyBytes, mv_data: &records[i].key[0])
+        var v = MDB_val(mv_size: ValueBytes, mv_data: &records[i].value[0])
+        if not lmdb_ok(mdb_put(txn, dbi, &k, &v, 0), "put"): return false
+    if not lmdb_ok(mdb_txn_commit(txn), "txn_commit"): return false
+
+    if not lmdb_ok(mdb_txn_begin(env, null, MDB_RDONLY, &txn), "txn_begin read"): return false
+    mdb_txn_reset(txn)
+    if not lmdb_ok(mdb_txn_renew(txn), "txn_renew"): return false
+    var want = record(Group, 3)
+    var k = MDB_val(mv_size: KeyBytes, mv_data: &want.key[0])
+    var d: MDB_val
+    if not lmdb_ok(mdb_get(txn, dbi, &k, &d), "get"): return false
+    if not is_nth(3, k.mv_data, k.mv_size, d.mv_data, d.mv_size): return fail("lmdb", "get", "wrong value")
+
+    var cursor: *MDB_cursor
+    if not lmdb_ok(mdb_cursor_open(txn, dbi, &cursor), "cursor_open"): return false
+    k = MDB_val(mv_size: Prefix.len, mv_data: Prefix.ptr)
+    var found = 0
+    var rc = mdb_cursor_get(cursor, &k, &d, MDB_SET_RANGE)
+    while rc == MDB_SUCCESS and has_prefix(k.mv_data, k.mv_size)
+        if not is_nth(found, k.mv_data, k.mv_size, d.mv_data, d.mv_size): return fail("lmdb", "cursor", "keys out of order")
+        found += 1
+        rc = mdb_cursor_get(cursor, &k, &d, MDB_NEXT)
+    if rc != MDB_SUCCESS and rc != MDB_NOTFOUND: return lmdb_ok(rc, "cursor_get")
+    if found != InGroup
+        print("FAIL lmdb: cursor: found {found} keys with the prefix")
+        return false
+    mdb_cursor_close(cursor)
+    mdb_txn_abort(txn)
+    if not lmdb_ok(mdb_env_sync(env, 1), "env_sync"): return false
+    let open_size = file_size(format(&file_buffer, "{path}/data.mdb"))
+    mdb_env_close(env)
+
+    let size = file_size(format(&file_buffer, "{path}/data.mdb"))
+    print("OK lmdb {mdb_version(null, null, null)}: put {Count} in one transaction, read one back, prefix seek walked {found}; with a 1 GiB map data.mdb is {open_size} bytes open, {size} closed")
+    return true
+
+fn mdbx_ok(rc: int, what: str) -> bool
+    if rc == MDBX_SUCCESS: return true
+    return fail("mdbx", what, str(mdbx_strerror(rc)))
+
+fn smoke_mdbx(base: str) -> bool
+    var path_buffer: [1024]u8
+    var file_buffer: [1100]u8
+    let path = format(&path_buffer, "{base}/mdbx")
+    mdbx_setup_debug(MDBX_LOG_WARN, MDBX_DBG_DONTCHANGE, MDBX_LOGGER_DONTCHANGE)
+    let gone = mdbx_env_delete(path.ptr, MDBX_ENV_JUST_DELETE)
+    if gone != MDBX_RESULT_TRUE and not mdbx_ok(gone, "env_delete"): return false
+
+    var env: *MDBX_env
+    if not mdbx_ok(mdbx_env_create(&env), "env_create"): return false
+    if not mdbx_ok(mdbx_env_set_geometry(env, -1, -1, 1 << 30, 16 << 20, -1, -1), "env_set_geometry"): return false
+    if not mdbx_ok(mdbx_env_set_option(env, MDBX_opt_max_readers, 64), "env_set_option"): return false
+    if not mdbx_ok(mdbx_env_open(env, path.ptr, MDBX_NOSTICKYTHREADS | MDBX_SAFE_NOSYNC, 0x1A4), "env_open"): return false
+
+    var txn: *MDBX_txn
+    var dbi: MDBX_dbi
+    if not mdbx_ok(mdbx_txn_begin(env, null, MDBX_TXN_READWRITE, &txn), "txn_begin"): return false
+    if not mdbx_ok(mdbx_dbi_open(txn, null, MDBX_CREATE, &dbi), "dbi_open"): return false
+    for i in 0..Count
+        var k = MDBX_val(iov_base: &records[i].key[0], iov_len: KeyBytes)
+        var v = MDBX_val(iov_base: &records[i].value[0], iov_len: ValueBytes)
+        if not mdbx_ok(mdbx_put(txn, dbi, &k, &v, MDBX_UPSERT), "put"): return false
+    if not mdbx_ok(mdbx_txn_commit(txn), "txn_commit"): return false
+
+    if not mdbx_ok(mdbx_txn_begin(env, null, MDBX_TXN_RDONLY, &txn), "txn_begin read"): return false
+    if not mdbx_ok(mdbx_txn_reset(txn), "txn_reset"): return false
+    if not mdbx_ok(mdbx_txn_renew(txn), "txn_renew"): return false
+    var want = record(Group, 3)
+    var k = MDBX_val(iov_base: &want.key[0], iov_len: KeyBytes)
+    var d: MDBX_val
+    if not mdbx_ok(mdbx_get(txn, dbi, &k, &d), "get"): return false
+    if not is_nth(3, k.iov_base, k.iov_len, d.iov_base, d.iov_len): return fail("mdbx", "get", "wrong value")
+
+    var cursor: *MDBX_cursor
+    if not mdbx_ok(mdbx_cursor_open(txn, dbi, &cursor), "cursor_open"): return false
+    k = MDBX_val(iov_base: Prefix.ptr, iov_len: Prefix.len)
+    var found = 0
+    var rc = mdbx_cursor_get(cursor, &k, &d, MDBX_SET_RANGE)
+    while rc == MDBX_SUCCESS and has_prefix(k.iov_base, k.iov_len)
+        if not is_nth(found, k.iov_base, k.iov_len, d.iov_base, d.iov_len): return fail("mdbx", "cursor", "keys out of order")
+        found += 1
+        rc = mdbx_cursor_get(cursor, &k, &d, MDBX_NEXT)
+    if rc != MDBX_SUCCESS and rc != MDBX_NOTFOUND: return mdbx_ok(rc, "cursor_get")
+    if found != InGroup
+        print("FAIL mdbx: cursor: found {found} keys with the prefix")
+        return false
+    mdbx_cursor_close(cursor)
+    if not mdbx_ok(mdbx_txn_abort(txn), "txn_abort"): return false
+    let synced = mdbx_env_sync(env)
+    if synced != MDBX_RESULT_TRUE and not mdbx_ok(synced, "env_sync"): return false
+    let open_size = file_size(format(&file_buffer, "{path}/mdbx.dat"))
+    if not mdbx_ok(mdbx_env_close(env), "env_close"): return false
+
+    let size = file_size(format(&file_buffer, "{path}/mdbx.dat"))
+    print("OK mdbx {mdbx_version.major}.{mdbx_version.minor}.{mdbx_version.patch}: put {Count} in one transaction, read one back, prefix seek walked {found}; with a 1 GiB upper size mdbx.dat is {open_size} bytes open, {size} closed")
+    return true
+
+fn smoke_rocksdb(base: str) -> bool
+    var path_buffer: [1024]u8
+    let path = format(&path_buffer, "{base}/rocksdb")
+    var err: cstr
+
+    let options = rocksdb_options_create()
+    rocksdb_options_set_create_if_missing(options, 1)
+    rocksdb_options_increase_parallelism(options, 4)
+    rocksdb_options_optimize_level_style_compaction(options, 64 << 20)
+    rocksdb_options_set_write_buffer_size(options, 16 << 20)
+    rocksdb_options_set_compression(options, rocksdb_no_compression)
+    let table = rocksdb_block_based_options_create()
+    let cache = rocksdb_cache_create_lru(8 << 20)
+    rocksdb_block_based_options_set_block_cache(table, cache)
+    rocksdb_block_based_options_set_filter_policy(table, rocksdb_filterpolicy_create_bloom(10.0))
+    rocksdb_options_set_block_based_table_factory(options, table)
+
+    rocksdb_destroy_db(options, path.ptr, &err)
+    if err: return fail("rocksdb", "destroy_db", str(err))
+    let db = rocksdb_open(options, path.ptr, &err)
+    if err: return fail("rocksdb", "open", str(err))
+
+    let write = rocksdb_writeoptions_create()
+    rocksdb_writeoptions_set_sync(write, 0)
+    rocksdb_writeoptions_disable_WAL(write, 0)
+    let batch = rocksdb_writebatch_create()
+    for i in 0..Count: rocksdb_writebatch_put(batch, &records[i].key[0], KeyBytes, &records[i].value[0], ValueBytes)
+    let batched = rocksdb_writebatch_count(batch)
+    rocksdb_write(db, write, batch, &err)
+    if err: return fail("rocksdb", "write", str(err))
+    rocksdb_writebatch_clear(batch)
+    rocksdb_writebatch_destroy(batch)
+
+    let read = rocksdb_readoptions_create()
+    var want = record(Group, 3)
+    var length: u64 = 0
+    let value = rocksdb_get(db, read, &want.key[0], KeyBytes, &length, &err)
+    if err: return fail("rocksdb", "get", str(err))
+    if not value or not is_nth(3, &want.key[0], KeyBytes, value, length): return fail("rocksdb", "get", "wrong value")
+    rocksdb_free(value)
+
+    let it = rocksdb_create_iterator(db, read)
+    rocksdb_iter_seek(it, Prefix.ptr, Prefix.len)
+    var found = 0
+    while rocksdb_iter_valid(it) != 0
+        var key_len: u64 = 0
+        var value_len: u64 = 0
+        let key = rocksdb_iter_key(it, &key_len)
+        if not has_prefix(key, key_len): break
+        let val = rocksdb_iter_value(it, &value_len)
+        if not is_nth(found, key, key_len, val, value_len): return fail("rocksdb", "iterator", "keys out of order")
+        found += 1
+        rocksdb_iter_next(it)
+    rocksdb_iter_get_error(it, &err)
+    if err: return fail("rocksdb", "iterator", str(err))
+    rocksdb_iter_destroy(it)
+    if found != InGroup
+        print("FAIL rocksdb: iterator: found {found} keys with the prefix")
+        return false
+
+    let flush = rocksdb_flushoptions_create()
+    rocksdb_flushoptions_set_wait(flush, 1)
+    rocksdb_flush(db, flush, &err)
+    if err: return fail("rocksdb", "flush", str(err))
+    rocksdb_flushoptions_destroy(flush)
+    rocksdb_compact_range(db, null, 0, null, 0)
+    let keys = rocksdb_property_value(db, "rocksdb.estimate-num-keys".ptr)
+    let estimate = keys ? str(keys) : "?"
+
+    print("OK rocksdb 11.12: put {batched} in one write batch, read one back, prefix seek walked {found}; flushed and compacted, estimate-num-keys {estimate}")
+    rocksdb_free_text(keys)
+    rocksdb_readoptions_destroy(read)
+    rocksdb_writeoptions_destroy(write)
+    rocksdb_close(db)
+    rocksdb_options_destroy(options)
+    rocksdb_block_based_options_destroy(table)
+    rocksdb_cache_destroy(cache)
+    return true
+
+fn smoke_leveldb(base: str) -> bool
+    var path_buffer: [1024]u8
+    let path = format(&path_buffer, "{base}/leveldb")
+    var err: cstr
+
+    let options = leveldb_options_create()
+    leveldb_options_set_create_if_missing(options, 1)
+    leveldb_options_set_write_buffer_size(options, 16 << 20)
+    leveldb_options_set_compression(options, leveldb_no_compression)
+    let cache = leveldb_cache_create_lru(8 << 20)
+    let bloom = leveldb_filterpolicy_create_bloom(10)
+    leveldb_options_set_cache(options, cache)
+    leveldb_options_set_filter_policy(options, bloom)
+
+    leveldb_destroy_db(options, path.ptr, &err)
+    if err: return fail("leveldb", "destroy_db", str(err))
+    let db = leveldb_open(options, path.ptr, &err)
+    if err: return fail("leveldb", "open", str(err))
+
+    let write = leveldb_writeoptions_create()
+    leveldb_writeoptions_set_sync(write, 0)
+    let batch = leveldb_writebatch_create()
+    for i in 0..Count: leveldb_writebatch_put(batch, &records[i].key[0], KeyBytes, &records[i].value[0], ValueBytes)
+    leveldb_write(db, write, batch, &err)
+    if err: return fail("leveldb", "write", str(err))
+    leveldb_writebatch_clear(batch)
+    leveldb_writebatch_destroy(batch)
+
+    let read = leveldb_readoptions_create()
+    var want = record(Group, 3)
+    var length: u64 = 0
+    let value = leveldb_get(db, read, &want.key[0], KeyBytes, &length, &err)
+    if err: return fail("leveldb", "get", str(err))
+    if not value or not is_nth(3, &want.key[0], KeyBytes, value, length): return fail("leveldb", "get", "wrong value")
+    leveldb_free(value)
+
+    let it = leveldb_create_iterator(db, read)
+    leveldb_iter_seek(it, Prefix.ptr, Prefix.len)
+    var found = 0
+    while leveldb_iter_valid(it) != 0
+        var key_len: u64 = 0
+        var value_len: u64 = 0
+        let key = leveldb_iter_key(it, &key_len)
+        if not has_prefix(key, key_len): break
+        let val = leveldb_iter_value(it, &value_len)
+        if not is_nth(found, key, key_len, val, value_len): return fail("leveldb", "iterator", "keys out of order")
+        found += 1
+        leveldb_iter_next(it)
+    leveldb_iter_get_error(it, &err)
+    if err: return fail("leveldb", "iterator", str(err))
+    leveldb_iter_destroy(it)
+    if found != InGroup
+        print("FAIL leveldb: iterator: found {found} keys with the prefix")
+        return false
+
+    leveldb_compact_range(db, null, 0, null, 0)
+    let files = leveldb_property_value(db, "leveldb.num-files-at-level0".ptr)
+    let level0 = files ? str(files) : "?"
+
+    print("OK leveldb {leveldb_major_version()}.{leveldb_minor_version()}: put {Count} in one write batch, read one back, prefix seek walked {found}; compacted, files at level 0: {level0}")
+    leveldb_free_text(files)
+    leveldb_readoptions_destroy(read)
+    leveldb_writeoptions_destroy(write)
+    leveldb_close(db)
+    leveldb_options_destroy(options)
+    leveldb_cache_destroy(cache)
+    leveldb_filterpolicy_destroy(bloom)
+    return true
+
+fn default_base(buffer: *[1024]u8) -> str
+    let exe = arg(0)
+    var cut: i64 = -1
+    for i in 0..exe.len
+        if exe[i] == '/' or exe[i] == 92: cut = i
+    if cut < 0: return format(buffer, "smoke")
+    let folder = exe[0..cut]
+    return format(buffer, "{folder}/smoke")
+
+fn main()
+    fill()
+    var base_buffer: [1024]u8
+    let base = arg_count() > 1 ? arg(1) : default_base(&base_buffer)
+    _mkdir(base.ptr)
+    var failed = 0
+    if not smoke_lmdb(base): failed += 1
+    if not smoke_mdbx(base): failed += 1
+    if not smoke_rocksdb(base): failed += 1
+    if not smoke_leveldb(base): failed += 1
+    if failed > 0
+        print("smoke: {failed} of 4 failed")
+        exit(1)
+    print("smoke: all 4 stores OK, in {base}")

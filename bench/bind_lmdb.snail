@@ -1,0 +1,88 @@
+extern include "lmdb.h"
+
+extern type MDB_env
+extern type MDB_txn
+extern type MDB_cursor
+extern type MDB_dbi = u32
+extern type mdb_size_t = u64
+extern type mdb_mode_t = int
+
+extern struct MDB_val
+    mv_size: u64
+    mv_data: *void
+
+extern enum MDB_cursor_op
+    MDB_FIRST = 0
+    MDB_FIRST_DUP = 1
+    MDB_GET_BOTH = 2
+    MDB_GET_BOTH_RANGE = 3
+    MDB_GET_CURRENT = 4
+    MDB_GET_MULTIPLE = 5
+    MDB_LAST = 6
+    MDB_LAST_DUP = 7
+    MDB_NEXT = 8
+    MDB_NEXT_DUP = 9
+    MDB_NEXT_MULTIPLE = 10
+    MDB_NEXT_NODUP = 11
+    MDB_PREV = 12
+    MDB_PREV_DUP = 13
+    MDB_PREV_NODUP = 14
+    MDB_SET = 15
+    MDB_SET_KEY = 16
+    MDB_SET_RANGE = 17
+    MDB_PREV_MULTIPLE = 18
+
+extern const MDB_VERSION_MAJOR: int = 1
+extern const MDB_VERSION_MINOR: int = 0
+extern const MDB_VERSION_PATCH: int = 2
+
+extern const MDB_NOSUBDIR: u32 = 0x4000
+extern const MDB_NOSYNC: u32 = 0x10000
+extern const MDB_RDONLY: u32 = 0x20000
+extern const MDB_NOMETASYNC: u32 = 0x40000
+extern const MDB_WRITEMAP: u32 = 0x80000
+extern const MDB_MAPASYNC: u32 = 0x100000
+extern const MDB_NOTLS: u32 = 0x200000
+extern const MDB_NOLOCK: u32 = 0x400000
+extern const MDB_NORDAHEAD: u32 = 0x800000
+extern const MDB_NOMEMINIT: u32 = 0x1000000
+
+extern const MDB_REVERSEKEY: u32 = 0x02
+extern const MDB_INTEGERKEY: u32 = 0x08
+extern const MDB_CREATE: u32 = 0x40000
+
+extern const MDB_NOOVERWRITE: u32 = 0x10
+extern const MDB_APPEND: u32 = 0x20000
+
+extern const MDB_SUCCESS: int = 0
+extern const MDB_KEYEXIST: int = -30799
+extern const MDB_NOTFOUND: int = -30798
+extern const MDB_MAP_FULL: int = -30792
+extern const MDB_READERS_FULL: int = -30790
+extern const MDB_BAD_TXN: int = -30782
+
+extern fn mdb_version(major: *int, minor: *int, patch: *int) -> cstr
+extern fn mdb_strerror(err: int) -> cstr
+
+extern fn mdb_env_create(env: **MDB_env) -> int
+extern fn mdb_env_set_mapsize(env: *MDB_env, size: mdb_size_t) -> int
+extern fn mdb_env_set_maxreaders(env: *MDB_env, readers: u32) -> int
+extern fn mdb_env_set_maxdbs(env: *MDB_env, dbs: MDB_dbi) -> int
+extern fn mdb_env_open(env: *MDB_env, path: *u8, flags: u32, mode: mdb_mode_t) -> int
+extern fn mdb_env_sync(env: *MDB_env, force: int) -> int
+extern fn mdb_env_close(env: *MDB_env)
+
+extern fn mdb_txn_begin(env: *MDB_env, parent: *MDB_txn, flags: u32, txn: **MDB_txn) -> int
+extern fn mdb_txn_commit(txn: *MDB_txn) -> int
+extern fn mdb_txn_abort(txn: *MDB_txn)
+extern fn mdb_txn_reset(txn: *MDB_txn)
+extern fn mdb_txn_renew(txn: *MDB_txn) -> int
+
+extern fn mdb_dbi_open(txn: *MDB_txn, name: *u8, flags: u32, dbi: *MDB_dbi) -> int
+extern fn mdb_get(txn: *MDB_txn, dbi: MDB_dbi, key: *MDB_val, data: *MDB_val) -> int
+extern fn mdb_put(txn: *MDB_txn, dbi: MDB_dbi, key: *MDB_val, data: *MDB_val, flags: u32) -> int
+
+extern fn mdb_cursor_open(txn: *MDB_txn, dbi: MDB_dbi, cursor: **MDB_cursor) -> int
+extern fn mdb_cursor_renew(txn: *MDB_txn, cursor: *MDB_cursor) -> int
+extern fn mdb_cursor_get(cursor: *MDB_cursor, key: *MDB_val, data: *MDB_val, op: MDB_cursor_op) -> int
+extern fn mdb_cursor_close(cursor: *MDB_cursor)

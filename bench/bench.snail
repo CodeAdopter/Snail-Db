@@ -1,0 +1,813 @@
+use snaildb/snaildb
+use bind_sqlite
+use bind_lmdb
+use bind_mdbx
+use bind_rocksdb
+use bind_leveldb
+
+const Batch = 10000
+const Lookups = 1000000
+const Ranges = 2000
+const RangePositions = 100
+const LiveOps = 20000
+const RaceMs = 3000
+const Readers = 3
+const CacheBytes: u64 = 268435456
+const MapBytes: u64 = 8589934592
+const Stores = 6
+
+const Schema = "PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-262144; PRAGMA mmap_size=4294967296; CREATE TABLE IF NOT EXISTS evals(key INTEGER NOT NULL, engine INTEGER NOT NULL, multipv INTEGER NOT NULL, depth INTEGER, seldepth INTEGER, bound INTEGER, score INTEGER, wdl INTEGER, nodes INTEGER, time_ms INTEGER, stamp INTEGER, pv BLOB, PRIMARY KEY(key, engine, multipv)) WITHOUT ROWID;"
+const Insert = "INSERT INTO evals VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key, engine, multipv) DO UPDATE SET depth=excluded.depth, seldepth=excluded.seldepth, bound=excluded.bound, score=excluded.score, wdl=excluded.wdl, nodes=excluded.nodes, time_ms=excluded.time_ms, stamp=excluded.stamp, pv=excluded.pv WHERE excluded.depth > evals.depth OR (excluded.depth = evals.depth AND excluded.nodes > evals.nodes)"
+const Select = "SELECT engine, multipv, depth, seldepth, bound, score, wdl, nodes, time_ms, stamp, pv FROM evals WHERE key = ?"
+const SelectRange = "SELECT engine, multipv, depth, seldepth, bound, score, wdl, nodes, time_ms, stamp, pv FROM evals WHERE key BETWEEN ? AND ?"
+
+enum Engine: u8
+    SnailDb
+    Sqlite
+    Lmdb
+    Mdbx
+    RocksDb
+    LevelDb
+
+fn engine_name(e: Engine) -> str
+    match e
+        SnailDb: return "Snail Db"
+        Sqlite: return "SQLite"
+        Lmdb: return "LMDB"
+        Mdbx: return "libmdbx"
+        RocksDb: return "RocksDB"
+        LevelDb: return "LevelDB"
+
+fn engine_folder(e: Engine) -> str
+    match e
+        SnailDb: return "snaildb"
+        Sqlite: return "sqlite"
+        Lmdb: return "lmdb"
+        Mdbx: return "mdbx"
+        RocksDb: return "rocksdb"
+        LevelDb: return "leveldb"
+
+struct Eval
+    key: u64
+    engine: u16
+    multipv: u8
+    depth: u8
+    seldepth: u8
+    bound: u8
+    pv_len: u8
+    flags: u8
+    score: i32
+    wdl: u32
+    nodes: u64
+    time_ms: u32
+    stamp: u32
+    pv: [12]u16
+
+fn eval_better(a: *u8, b: *u8) -> bool
+    let x = a as *Eval
+    let y = b as *Eval
+    if x.depth != y.depth: return x.depth > y.depth
+    if x.nodes != y.nodes: return x.nodes > y.nodes
+    return x.stamp > y.stamp
+
+fn mix(x: u64) -> u64
+    var z = x + 0x9E3779B97F4A7C15
+    z = (z ^ z >> 30) * 0xBF58476D1CE4E5B9
+    z = (z ^ z >> 27) * 0x94D049BB133111EB
+    return z ^ z >> 31
+
+fn key_of(i: i64) -> u64
+    return mix(i as u64 * 2 + 1)
+
+fn miss_of(i: i64) -> u64
+    return mix(i as u64 * 2 + 2)
+
+fn engines_of(key: u64) -> int
+    return 1 + (key >> 40) as int % 3
+
+fn eval_of(key: u64, engine: int) -> Eval
+    let r = mix(key ^ engine as u64)
+    var e = Eval(key: key, engine: engine as u16, multipv: 1, depth: (18 + r % 30) as u8, seldepth: (30 + r % 20) as u8)
+    e.score = (r >> 8) as i32 % 300 - 150
+    e.nodes = r >> 20
+    e.time_ms = (r >> 44) as u32
+    e.stamp = 1793000000
+    e.pv_len = 8
+    for i in 0..8: e.pv[i] = (r >> i * 4) as u16 & 0x7FFF
+    return e
+
+fn kv_key(e: *Eval, out: *u8)
+    (out as *u64)[0] = e.key.swap_bytes
+    out[8] = (e.engine >> 8) as u8
+    out[9] = (e.engine & 255) as u8
+    out[10] = e.multipv
+
+fn position_of(k: *u8) -> u64
+    return (k as *u64)[0].swap_bytes
+
+struct Store
+    kind: Engine
+    folder: [..]u8
+    db: Db
+    evals: *DbTable
+    lmdb: *MDB_env
+    lmdb_dbi: MDB_dbi
+    mdbx: *MDBX_env
+    mdbx_dbi: MDBX_dbi
+    rocks: *rocksdb_t
+    rocks_options: *rocksdb_options_t
+    rocks_write: *rocksdb_writeoptions_t
+    rocks_point: *rocksdb_readoptions_t
+    rocks_scan: *rocksdb_readoptions_t
+    level: *leveldb_t
+    level_options: *leveldb_options_t
+    level_cache: *leveldb_cache_t
+    level_filter: *leveldb_filterpolicy_t
+    level_write: *leveldb_writeoptions_t
+    level_read: *leveldb_readoptions_t
+
+    fn path() -> str
+        return str(folder[0..folder.len - 1])
+
+    fn open(engine: Engine, at: str) -> bool
+        kind = engine
+        folder.clear()
+        db_add(&folder, at)
+        folder.push('/')
+        db_add(&folder, engine_folder(engine))
+        folder.push(0)
+        let p = path()
+        sn_db_make_folder(p.ptr, p.len as int)
+        var err: cstr = null
+        match kind
+            SnailDb
+                if not evals: evals = db.table("evals", sizeof(Eval), 3, eval_better)
+                if not db.open(p)
+                    print("Snail Db: {db.error}")
+                    return false
+            Sqlite
+                pass_sqlite()
+            Lmdb
+                mdb_env_create(&lmdb)
+                mdb_env_set_mapsize(lmdb, MapBytes)
+                mdb_env_set_maxreaders(lmdb, 64)
+                let rc = mdb_env_open(lmdb, p.ptr, MDB_NOSYNC, 0x1A4)
+                if rc != 0
+                    print("LMDB: {mdb_strerror(rc)}")
+                    return false
+                var txn: *MDB_txn = null
+                mdb_txn_begin(lmdb, null, 0, &txn)
+                mdb_dbi_open(txn, null, 0, &lmdb_dbi)
+                mdb_txn_commit(txn)
+            Mdbx
+                mdbx_setup_debug(MDBX_LOG_WARN, MDBX_DBG_DONTCHANGE, MDBX_LOGGER_DONTCHANGE)
+                mdbx_env_create(&mdbx)
+                mdbx_env_set_geometry(mdbx, -1, -1, MapBytes as i64, 268435456, 0, -1)
+                mdbx_env_set_option(mdbx, MDBX_opt_max_readers, 64)
+                mdbx_env_set_option(mdbx, MDBX_opt_sync_bytes, 0)
+                mdbx_env_set_option(mdbx, MDBX_opt_sync_period, 0)
+                let rc = mdbx_env_open(mdbx, p.ptr, MDBX_SAFE_NOSYNC, 0x1A4)
+                if rc != 0
+                    print("libmdbx: {mdbx_strerror(rc)}")
+                    return false
+                var txn: *MDBX_txn = null
+                mdbx_txn_begin(mdbx, null, MDBX_TXN_READWRITE, &txn)
+                mdbx_dbi_open(txn, null, MDBX_DB_DEFAULTS, &mdbx_dbi)
+                mdbx_txn_commit(txn)
+            RocksDb
+                rocks_options = rocksdb_options_create()
+                rocksdb_options_set_create_if_missing(rocks_options, 1)
+                rocksdb_options_increase_parallelism(rocks_options, cpu_count())
+                rocksdb_options_optimize_level_style_compaction(rocks_options, 536870912)
+                rocksdb_options_set_compression(rocks_options, rocksdb_no_compression)
+                rocksdb_options_set_max_open_files(rocks_options, -1)
+                let table = rocksdb_block_based_options_create()
+                rocksdb_block_based_options_set_block_cache(table, rocksdb_cache_create_lru(CacheBytes))
+                rocksdb_block_based_options_set_filter_policy(table, rocksdb_filterpolicy_create_bloom(10.0))
+                rocksdb_options_set_block_based_table_factory(rocks_options, table)
+                rocksdb_options_set_prefix_extractor(rocks_options, rocksdb_slicetransform_create_fixed_prefix(8))
+                rocks = rocksdb_open(rocks_options, p.ptr, &err)
+                if err
+                    print("RocksDB: {err}")
+                    rocksdb_free_text(err)
+                    return false
+                rocks_write = rocksdb_writeoptions_create()
+                rocksdb_writeoptions_set_sync(rocks_write, 0)
+                rocks_point = rocksdb_readoptions_create()
+                rocksdb_readoptions_set_prefix_same_as_start(rocks_point, 1)
+                rocks_scan = rocksdb_readoptions_create()
+                rocksdb_readoptions_set_total_order_seek(rocks_scan, 1)
+            LevelDb
+                level_options = leveldb_options_create()
+                leveldb_options_set_create_if_missing(level_options, 1)
+                level_cache = leveldb_cache_create_lru(CacheBytes)
+                level_filter = leveldb_filterpolicy_create_bloom(10)
+                leveldb_options_set_cache(level_options, level_cache)
+                leveldb_options_set_filter_policy(level_options, level_filter)
+                leveldb_options_set_write_buffer_size(level_options, 67108864)
+                leveldb_options_set_max_file_size(level_options, 33554432)
+                leveldb_options_set_compression(level_options, leveldb_no_compression)
+                leveldb_options_set_max_open_files(level_options, 10000)
+                level = leveldb_open(level_options, p.ptr, &err)
+                if err
+                    print("LevelDB: {err}")
+                    leveldb_free_text(err)
+                    return false
+                level_write = leveldb_writeoptions_create()
+                leveldb_writeoptions_set_sync(level_write, 0)
+                level_read = leveldb_readoptions_create()
+        return true
+
+    fn pass_sqlite()
+        return
+
+    fn settle(w: *Worker)
+        match kind
+            SnailDb: db.settle()
+            Sqlite: w.lite.exec("PRAGMA wal_checkpoint(TRUNCATE)")
+            Lmdb: mdb_env_sync(lmdb, 1)
+            Mdbx: mdbx_env_sync_ex(mdbx, true, false)
+            RocksDb
+                var err: cstr = null
+                let f = rocksdb_flushoptions_create()
+                rocksdb_flushoptions_set_wait(f, 1)
+                rocksdb_flush(rocks, f, &err)
+                rocksdb_flushoptions_destroy(f)
+                let start = now_ms()
+                while now_ms() - start < 120000 and (rocks_busy("rocksdb.num-running-compactions") or rocks_busy("rocksdb.compaction-pending") or rocks_busy("rocksdb.num-running-flushes")): sleep_ms(10)
+            LevelDb: leveldb_compact_range(level, null, 0, null, 0)
+
+    fn rocks_busy(property: str) -> bool
+        let v = rocksdb_property_value(rocks, property.ptr)
+        if not v: return false
+        let busy = parse_int(str(v)) != 0
+        rocksdb_free_text(v)
+        return busy
+
+    fn close()
+        match kind
+            SnailDb: db.close()
+            Sqlite: pass_sqlite()
+            Lmdb: mdb_env_close(lmdb)
+            Mdbx: mdbx_env_close(mdbx)
+            RocksDb
+                rocksdb_close(rocks)
+                rocksdb_writeoptions_destroy(rocks_write)
+                rocksdb_readoptions_destroy(rocks_point)
+                rocksdb_readoptions_destroy(rocks_scan)
+                rocksdb_options_destroy(rocks_options)
+            LevelDb
+                leveldb_close(level)
+                leveldb_writeoptions_destroy(level_write)
+                leveldb_readoptions_destroy(level_read)
+                leveldb_options_destroy(level_options)
+                leveldb_cache_destroy(level_cache)
+                leveldb_filterpolicy_destroy(level_filter)
+
+struct Lite
+    db: *sqlite3
+    put: *sqlite3_stmt
+    get: *sqlite3_stmt
+    scan: *sqlite3_stmt
+
+    fn open(path: str) -> bool
+        if sqlite3_open_v2(path.ptr, &db, SqlOpen, null) != 0: return false
+        exec(Schema)
+        sqlite3_prepare_v2(db, Insert.ptr, -1, &put, null)
+        sqlite3_prepare_v2(db, Select.ptr, -1, &get, null)
+        sqlite3_prepare_v2(db, SelectRange.ptr, -1, &scan, null)
+        return put and get and scan
+
+    fn exec(sql: str)
+        if sqlite3_exec(db, sql.ptr, null, null, null) != 0: print("sqlite: {sqlite3_errmsg(db)}")
+
+    fn insert(e: *Eval)
+        sqlite3_bind_int64(put, 1, e.key as i64)
+        sqlite3_bind_int64(put, 2, e.engine)
+        sqlite3_bind_int64(put, 3, e.multipv)
+        sqlite3_bind_int64(put, 4, e.depth)
+        sqlite3_bind_int64(put, 5, e.seldepth)
+        sqlite3_bind_int64(put, 6, e.bound)
+        sqlite3_bind_int64(put, 7, e.score)
+        sqlite3_bind_int64(put, 8, e.wdl)
+        sqlite3_bind_int64(put, 9, e.nodes as i64)
+        sqlite3_bind_int64(put, 10, e.time_ms)
+        sqlite3_bind_int64(put, 11, e.stamp)
+        sqlite3_bind_blob(put, 12, &e.pv[0], e.pv_len as int * 2, null)
+        sqlite3_step(put)
+        sqlite3_reset(put)
+
+    fn rows(stmt: *sqlite3_stmt, sum: *i64) -> int
+        var n = 0
+        while sqlite3_step(stmt) == SqlRow
+            for c in 0..10: sum[0] += sqlite3_column_int64(stmt, c)
+            n += 1
+        sqlite3_reset(stmt)
+        return n
+
+    fn close()
+        sqlite3_finalize(put)
+        sqlite3_finalize(get)
+        sqlite3_finalize(scan)
+        sqlite3_close_v2(db)
+
+struct Worker
+    store: *Store
+    lite: Lite
+    lmdb_read: *MDB_txn
+    lmdb_cursor: *MDB_cursor
+    lmdb_write: *MDB_txn
+    mdbx_read: *MDBX_txn
+    mdbx_cursor: *MDBX_cursor
+    mdbx_write: *MDBX_txn
+    rocks_batch: *rocksdb_writebatch_t
+    level_batch: *leveldb_writebatch_t
+    out: [..]u8
+    sum: i64
+
+    fn start(s: *Store)
+        store = s
+        match s.kind
+            Sqlite
+                var p: [..]u8
+                db_path(&p, s.path(), "bench.sqlite")
+                lite.open(str(p[0..p.len - 1]))
+                p.free()
+            Lmdb
+                mdb_txn_begin(s.lmdb, null, MDB_RDONLY, &lmdb_read)
+                mdb_cursor_open(lmdb_read, s.lmdb_dbi, &lmdb_cursor)
+                mdb_txn_reset(lmdb_read)
+            Mdbx
+                mdbx_txn_begin(s.mdbx, null, MDBX_TXN_RDONLY, &mdbx_read)
+                mdbx_cursor_open(mdbx_read, s.mdbx_dbi, &mdbx_cursor)
+                mdbx_txn_reset(mdbx_read)
+            RocksDb: rocks_batch = rocksdb_writebatch_create()
+            LevelDb: level_batch = leveldb_writebatch_create()
+            else: pass()
+
+    fn pass()
+        return
+
+    fn begin()
+        match store.kind
+            Sqlite: lite.exec("BEGIN")
+            Lmdb: mdb_txn_begin(store.lmdb, null, 0, &lmdb_write)
+            Mdbx: mdbx_txn_begin(store.mdbx, null, MDBX_TXN_READWRITE, &mdbx_write)
+            RocksDb: rocksdb_writebatch_clear(rocks_batch)
+            LevelDb: leveldb_writebatch_clear(level_batch)
+            else: pass()
+
+    fn put(e: *Eval)
+        var k: [16]u8
+        kv_key(e, &k[0])
+        var err: cstr = null
+        match store.kind
+            SnailDb: store.db.put(store.evals, e as *u8)
+            Sqlite: lite.insert(e)
+            Lmdb
+                var key = MDB_val(mv_size: 11, mv_data: &k[0])
+                var data: MDB_val
+                if mdb_get(lmdb_write, store.lmdb_dbi, &key, &data) == 0 and not eval_better(e as *u8, data.mv_data as *u8): return
+                data = MDB_val(mv_size: 64, mv_data: e)
+                mdb_put(lmdb_write, store.lmdb_dbi, &key, &data, 0)
+            Mdbx
+                var key = MDBX_val(iov_base: &k[0], iov_len: 11)
+                var data: MDBX_val
+                if mdbx_get(mdbx_write, store.mdbx_dbi, &key, &data) == 0 and not eval_better(e as *u8, data.iov_base as *u8): return
+                data = MDBX_val(iov_base: e, iov_len: 64)
+                mdbx_put(mdbx_write, store.mdbx_dbi, &key, &data, MDBX_UPSERT)
+            RocksDb
+                var n: u64 = 0
+                let old = rocksdb_get(store.rocks, store.rocks_point, &k[0], 11, &n, &err)
+                let keep = old and not eval_better(e as *u8, old)
+                if old: rocksdb_free(old)
+                if not keep: rocksdb_writebatch_put(rocks_batch, &k[0], 11, e as *u8, 64)
+            LevelDb
+                var n: u64 = 0
+                let old = leveldb_get(store.level, store.level_read, &k[0], 11, &n, &err)
+                let keep = old and not eval_better(e as *u8, old)
+                if old: leveldb_free(old)
+                if not keep: leveldb_writebatch_put(level_batch, &k[0], 11, e as *u8, 64)
+
+    fn commit()
+        var err: cstr = null
+        match store.kind
+            SnailDb: store.db.commit()
+            Sqlite: lite.exec("COMMIT")
+            Lmdb: mdb_txn_commit(lmdb_write)
+            Mdbx: mdbx_txn_commit(mdbx_write)
+            RocksDb: rocksdb_write(store.rocks, store.rocks_write, rocks_batch, &err)
+            LevelDb: leveldb_write(store.level, store.level_write, level_batch, &err)
+
+    fn lookup(key: u64) -> int
+        return walk(key, key, false)
+
+    fn range(from: u64, to: u64) -> int
+        return walk(from, to, true)
+
+    fn walk(from: u64, to: u64, scan: bool) -> int
+        var start: [16]u8
+        (&start[0] as *u64)[0] = from.swap_bytes
+        var n = 0
+        match store.kind
+            SnailDb
+                if scan
+                    var count = 0
+                    var total: i64 = 0
+                    store.db.range(store.evals, from, to, |r| count += visit(r, &total))
+                    sum += total
+                    return count
+                store.db.find(store.evals, from, &out)
+                for i in 0..out.len / 64: sum += (&out[i * 64] as *Eval).depth
+                return out.len / 64
+            Sqlite
+                if scan
+                    sqlite3_bind_int64(lite.scan, 1, from as i64)
+                    sqlite3_bind_int64(lite.scan, 2, to as i64)
+                    return lite.rows(lite.scan, &sum)
+                sqlite3_bind_int64(lite.get, 1, from as i64)
+                return lite.rows(lite.get, &sum)
+            Lmdb
+                mdb_txn_renew(lmdb_read)
+                mdb_cursor_renew(lmdb_read, lmdb_cursor)
+                var key = MDB_val(mv_size: 8, mv_data: &start[0])
+                var data: MDB_val
+                var rc = mdb_cursor_get(lmdb_cursor, &key, &data, MDB_SET_RANGE)
+                while rc == 0 and position_of(key.mv_data as *u8) <= to
+                    sum += (data.mv_data as *Eval).depth
+                    n += 1
+                    rc = mdb_cursor_get(lmdb_cursor, &key, &data, MDB_NEXT)
+                mdb_txn_reset(lmdb_read)
+            Mdbx
+                mdbx_txn_renew(mdbx_read)
+                mdbx_cursor_renew(mdbx_read, mdbx_cursor)
+                var key = MDBX_val(iov_base: &start[0], iov_len: 8)
+                var data: MDBX_val
+                var rc = mdbx_cursor_get(mdbx_cursor, &key, &data, MDBX_SET_RANGE)
+                while rc == 0 and position_of(key.iov_base as *u8) <= to
+                    sum += (data.iov_base as *Eval).depth
+                    n += 1
+                    rc = mdbx_cursor_get(mdbx_cursor, &key, &data, MDBX_NEXT)
+                mdbx_txn_reset(mdbx_read)
+            RocksDb
+                let it = rocksdb_create_iterator(store.rocks, scan ? store.rocks_scan : store.rocks_point)
+                rocksdb_iter_seek(it, &start[0], 8)
+                while rocksdb_iter_valid(it) != 0
+                    var kn: u64 = 0
+                    var vn: u64 = 0
+                    if position_of(rocksdb_iter_key(it, &kn)) > to: break
+                    sum += (rocksdb_iter_value(it, &vn) as *Eval).depth
+                    n += 1
+                    rocksdb_iter_next(it)
+                rocksdb_iter_destroy(it)
+            LevelDb
+                let it = leveldb_create_iterator(store.level, store.level_read)
+                leveldb_iter_seek(it, &start[0], 8)
+                while leveldb_iter_valid(it) != 0
+                    var kn: u64 = 0
+                    var vn: u64 = 0
+                    if position_of(leveldb_iter_key(it, &kn)) > to: break
+                    sum += (leveldb_iter_value(it, &vn) as *Eval).depth
+                    n += 1
+                    leveldb_iter_next(it)
+                leveldb_iter_destroy(it)
+        return n
+
+    fn finish()
+        match store.kind
+            Sqlite: lite.close()
+            Lmdb
+                mdb_cursor_close(lmdb_cursor)
+                mdb_txn_abort(lmdb_read)
+            Mdbx
+                mdbx_cursor_close(mdbx_cursor)
+                mdbx_txn_abort(mdbx_read)
+            RocksDb: rocksdb_writebatch_destroy(rocks_batch)
+            LevelDb: leveldb_writebatch_destroy(level_batch)
+            else: pass()
+        out.free()
+
+fn visit(r: *u8, total: *i64) -> int
+    total[0] += (r as *Eval).depth
+    return 1
+
+struct Result
+    ran: bool
+    insert_ms: f64
+    fresh_ns: f64
+    settle_ms: f64
+    hit_ns: f64
+    miss_ns: f64
+    range_us: f64
+    live_us: f64
+    reads: f64
+    writes: f64
+    open_ms: f64
+    bytes: i64
+    found: i64
+
+struct Racer
+    store: *Store
+    writer: bool
+    positions: i64
+    seed: u64
+    @volatile stop: int
+    ops: i64
+    sum: i64
+
+fn race_work(r: *Racer)
+    var w: Worker
+    w.start(r.store)
+    var i: i64 = 0
+    while r.stop == 0
+        if r.writer
+            if i % 100 == 0: w.begin()
+            var e = eval_of(key_of(r.positions + r.seed as i64 * 100000000 + i), 1)
+            w.put(&e)
+            if i % 100 == 99: w.commit()
+        else
+            r.sum += w.lookup(key_of((mix(r.seed + i as u64) % r.positions as u64) as i64))
+        i += 1
+    if r.writer and i % 100 != 0: w.commit()
+    w.finish()
+    r.ops = i
+
+fn race(store: *Store, positions: i64) -> (f64, f64)
+    var racers: [Readers + 1]Racer
+    var threads: [Readers + 1]u64
+    for k in 0..Readers + 1
+        racers[k] = Racer(store: store, writer: k == Readers, positions: positions, seed: (k + 1) as u64)
+        threads[k] = spawn(race_work, &racers[k])
+    sleep_ms(RaceMs)
+    for k in 0..Readers + 1: atomic_store(&racers[k].stop, 1)
+    var reads: i64 = 0
+    for k in 0..Readers + 1
+        join(threads[k])
+        if k < Readers: reads += racers[k].ops
+    let seconds = RaceMs as f64 / 1000.0
+    return reads as f64 / seconds, racers[Readers].ops as f64 / seconds
+
+fn ms_since(t: i64) -> f64
+    return (now_ns() - t) as f64 / 1000000.0
+
+fn folder_bytes(folder: str) -> i64
+    var names: [..]u8
+    var p: [..]u8
+    defer names.free()
+    defer p.free()
+    if not db_list(folder, &names): return 0
+    var total: i64 = 0
+    var start = 0
+    for i in 0..names.len
+        if names[i] != '\n': continue
+        var f: DbFile
+        if f.open(db_path(&p, folder, str(names[start..i])), DbRead)
+            total += f.size
+            f.close()
+        start = i + 1
+    return total
+
+fn empty_folder(folder: str)
+    var names: [..]u8
+    var p: [..]u8
+    defer names.free()
+    defer p.free()
+    if not db_list(folder, &names): return
+    var start = 0
+    for i in 0..names.len
+        if names[i] != '\n': continue
+        db_delete(db_path(&p, folder, str(names[start..i])))
+        start = i + 1
+
+fn run(kind: Engine, at: str, positions: i64, result: *Result)
+    var store: Store
+    var probe: [..]u8
+    defer probe.free()
+    empty_folder(db_path(&probe, at, engine_folder(kind)))
+    if not store.open(kind, at): return
+    var w: Worker
+    w.start(&store)
+    var t = now_ns()
+    var n: i64 = 0
+    w.begin()
+    for i in 0..positions
+        let key = key_of(i)
+        for engine in 1..engines_of(key) + 1
+            var e = eval_of(key, engine)
+            w.put(&e)
+            n += 1
+            if n % Batch == 0
+                w.commit()
+                w.begin()
+    w.commit()
+    result.insert_ms = ms_since(t)
+    t = now_ns()
+    for i in 0..Lookups: result.found += w.lookup(key_of((mix(i as u64) % positions as u64) as i64))
+    result.fresh_ns = ms_since(t) * 1000000.0 / Lookups as f64
+    t = now_ns()
+    store.settle(&w)
+    result.settle_ms = ms_since(t)
+    result.bytes = folder_bytes(store.path())
+    t = now_ns()
+    for i in 0..Lookups: result.found += w.lookup(key_of((mix(i as u64 + 7) % positions as u64) as i64))
+    result.hit_ns = ms_since(t) * 1000000.0 / Lookups as f64
+    t = now_ns()
+    for i in 0..Lookups: result.found += w.lookup(miss_of(i))
+    result.miss_ns = ms_since(t) * 1000000.0 / Lookups as f64
+    let width = 0xFFFFFFFFFFFFFFFF / positions as u64 * RangePositions as u64
+    t = now_ns()
+    for i in 0..Ranges
+        let from = mix(i as u64 + 99) & 0x3FFFFFFFFFFFFFFF
+        result.found += w.range(from, from + width)
+    result.range_us = ms_since(t) * 1000.0 / Ranges as f64
+    t = now_ns()
+    for i in 0..LiveOps
+        let key = key_of(positions * 4 + i)
+        var e = eval_of(key, 1)
+        w.begin()
+        w.put(&e)
+        w.commit()
+        result.found += w.lookup(key)
+    result.live_us = ms_since(t) * 1000.0 / LiveOps as f64
+    w.finish()
+    let (reads, writes) = race(&store, positions)
+    result.reads = reads
+    result.writes = writes
+    store.close()
+    t = now_ns()
+    store.open(kind, at)
+    var again: Worker
+    again.start(&store)
+    result.found += again.lookup(key_of(0))
+    result.open_ms = ms_since(t)
+    again.finish()
+    store.close()
+    if kind == SnailDb: store.db.release()
+    store.folder.free()
+    result.ran = true
+
+# A row of the tables: what it measures, how to read it from a result, its unit and decimals, and
+# whether higher is better. The typical lead leaves out reopening, where LevelDB and RocksDB swing by
+# seconds from run to run.
+struct Metric
+    title: str
+    value: fn(*Result) -> f64
+    unit: str
+    digits: int
+    higher: bool
+    typical: bool
+
+# How many times better Snail Db is than another store on a row, below 1 when it is behind.
+fn lead(m: *Metric, ours: *Result, theirs: *Result) -> f64
+    let a = m.value(ours)
+    let b = m.value(theirs)
+    return m.higher ? a / b : b / a
+
+# Snail Db's lead on a typical row against another store: the geometric mean of its leads.
+fn typical_lead(metrics: []Metric, ours: *Result, theirs: *Result) -> f64
+    var sum: f64 = 0.0
+    var n = 0
+    for i in 0..metrics.len
+        if not metrics[i].typical: continue
+        sum += log(lead(&metrics[i], ours, theirs))
+        n += 1
+    return exp(sum / n as f64)
+
+# A number as the tables show it, with commas between thousands.
+fn number(out: *[..]u8, v: f64, digits: int) -> str
+    var buffer: [64]u8
+    var text = format(&buffer, "{v:.0}")
+    if digits == 1: text = format(&buffer, "{v:.1}")
+    if digits == 2: text = format(&buffer, "{v:.2}")
+    var whole = 0
+    while whole < text.len and text[whole] != '.': whole += 1
+    out.clear()
+    for i in 0..text.len
+        if i > 0 and i < whole and (whole - i) % 3 == 0 and text[i - 1] != '-': out.push(',')
+        out.push(text[i])
+    return str(out[0..out.len])
+
+# A lead as the tables show it: whole above 100, with one decimal above 1, else with two.
+fn times(out: *[..]u8, r: f64) -> str
+    number(out, r, r >= 100.0 ? 0 : (r >= 1.0 ? 1 : 2))
+    out.push('x')
+    return str(out[0..out.len])
+
+# Text before and after a count with commas, for a title.
+fn counted(out: *[..]u8, before: str, n: i64, after: str) -> str
+    var digits: [..]u8
+    defer digits.free()
+    out.clear()
+    db_add(out, before)
+    db_add(out, number(&digits, n as f64, 0))
+    db_add(out, after)
+    return str(out[0..out.len])
+
+# A row of the table of every store, then how Snail Db compares with the best of the others.
+fn row(m: *Metric, results: []Result)
+    var text: [..]u8
+    defer text.free()
+    write("| {m.title} |")
+    var best = -1
+    for i in 0..Stores
+        if not results[i].ran: continue
+        write(" {number(&text, m.value(&results[i]), m.digits)} {m.unit} |")
+        if i == 0: continue
+        if best < 0 or lead(m, &results[i], &results[best]) > 1.0: best = i
+    if not results[0].ran or best < 0
+        print(" |")
+        return
+    let r = lead(m, &results[0], &results[best])
+    if r >= 1.0: print(" **{times(&text, r)}** |")
+    else: print(" {times(&text, r)} |")
+
+# The table of Snail Db's lead over each other store, row by row, the stores in the order given,
+# then its lead on a typical row.
+fn speed(metrics: []Metric, results: []Result, order: []int)
+    var text: [..]u8
+    defer text.free()
+    print("")
+    write("| Snail Db is ahead by |")
+    for i in order: write(" {engine_name(i as Engine)} |")
+    print("")
+    write("|---|")
+    for i in order: write("---|")
+    print("")
+    for j in 0..metrics.len
+        write("| {metrics[j].title} |")
+        for i in order: write(" {times(&text, lead(&metrics[j], &results[0], &results[i]))} |")
+        print("")
+    write("| **typical row** |")
+    for i in order: write(" **{times(&text, typical_lead(metrics, &results[0], &results[i]))}** |")
+    print("")
+
+fn main()
+    let positions = arg_count() > 1 ? parse_int(arg(1)) : 1000000
+    let at = arg_count() > 2 ? arg(2) : "../build/bench"
+    sn_db_make_folder(at.ptr, at.len as int)
+    sqlite3_initialize()
+    var wanted: [Stores]bool
+    for i in 0..Stores: wanted[i] = arg_count() <= 3
+    for a in 3..arg_count()
+        for i in 0..Stores
+            if arg(a) == engine_folder(i as Engine): wanted[i] = true
+    var records: i64 = 0
+    for i in 0..positions: records += engines_of(key_of(i))
+    var major = 0
+    var minor = 0
+    var patch = 0
+    mdb_version(&major, &minor, &patch)
+    print("{positions} positions, {records} records of 64 bytes, {cpu_count()} threads")
+    print("SQLite {sqlite3_libversion()}, LMDB {major}.{minor}.{patch}, libmdbx {mdbx_version.major}.{mdbx_version.minor}.{mdbx_version.patch}, RocksDB 11.12, LevelDB {leveldb_major_version()}.{leveldb_minor_version()}")
+    var results: [Stores]Result
+    for i in 0..Stores
+        if not wanted[i]: continue
+        let t = now_ns()
+        run(i as Engine, at, positions, &results[i])
+        print("{engine_name(i as Engine)} done in {ms_since(t) / 1000.0:.1} s, found {results[i].found}")
+    print("")
+    write("| |")
+    for i in 0..Stores
+        if results[i].ran: write(" {engine_name(i as Engine)} |")
+    print(" Snail Db vs best other |")
+    write("|---|")
+    for i in 0..Stores
+        if results[i].ran: write("---|")
+    print("---|")
+    let r = results[0..Stores]
+    var insert_title: [..]u8
+    var batch_title: [..]u8
+    var range_title: [128]u8
+    var race_title: [128]u8
+    defer insert_title.free()
+    defer batch_title.free()
+    db_add(&insert_title, counted(&batch_title, "insert ", records, " records, commit every "))
+    db_add(&insert_title, counted(&batch_title, "", Batch, ""))
+    var metrics: [..]Metric
+    defer metrics.free()
+    metrics.push(Metric(title: str(insert_title[0..insert_title.len]), value: |x| x.insert_ms, unit: "ms", digits: 0, higher: false, typical: true))
+    metrics.push(Metric(title: "lookup right after inserting", value: |x| x.fresh_ns, unit: "ns", digits: 0, higher: false, typical: true))
+    metrics.push(Metric(title: "settle on disk", value: |x| x.settle_ms, unit: "ms", digits: 0, higher: false, typical: true))
+    metrics.push(Metric(title: "lookup, key present", value: |x| x.hit_ns, unit: "ns", digits: 0, higher: false, typical: true))
+    metrics.push(Metric(title: "lookup, key absent", value: |x| x.miss_ns, unit: "ns", digits: 0, higher: false, typical: true))
+    metrics.push(Metric(title: format(&range_title, "range of {RangePositions} positions"), value: |x| x.range_us, unit: "µs", digits: 1, higher: false, typical: true))
+    metrics.push(Metric(title: "store one record, commit, read it back", value: |x| x.live_us, unit: "µs", digits: 1, higher: false, typical: true))
+    metrics.push(Metric(title: format(&race_title, "{Readers} readers + 1 writer: reads a second"), value: |x| x.reads / 1000000.0, unit: "M", digits: 2, higher: true, typical: true))
+    metrics.push(Metric(title: "the same: writes a second", value: |x| x.writes / 1000.0, unit: "k", digits: 0, higher: true, typical: true))
+    metrics.push(Metric(title: "reopen and first lookup", value: |x| x.open_ms, unit: "ms", digits: 1, higher: false, typical: false))
+    metrics.push(Metric(title: "size on disk", value: |x| x.bytes as f64 / 1048576.0, unit: "MB", digits: 1, higher: false, typical: true))
+    let m = metrics[0..metrics.len]
+    for i in 0..m.len: row(&m[i], r)
+    if not results[0].ran: return
+    # The others, from the one Snail Db leads most on a typical row to the one it leads least.
+    var others: [..]int
+    defer others.free()
+    for i in 1..Stores
+        if results[i].ran: others.push(i)
+    for i in 0..others.len
+        for j in i + 1..others.len
+            if typical_lead(m, &results[0], &results[others[j]]) > typical_lead(m, &results[0], &results[others[i]])
+                let held = others[i]
+                others[i] = others[j]
+                others[j] = held
+    speed(m, r, others[0..others.len])

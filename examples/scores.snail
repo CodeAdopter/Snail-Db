@@ -1,0 +1,45 @@
+use snaildb/snaildb
+
+struct Score
+    key: u64
+    player: u32
+    points: i32
+
+fn higher(a: *u8, b: *u8) -> bool
+    return (a as *Score).points > (b as *Score).points
+
+fn main()
+    var db: Db
+    let scores = db.table("scores", sizeof(Score), 4, higher)
+    let players = db.name_list("players")
+    let notes = db.journal("notes", sizeof(DbEntry))
+    if not db.open("build/scores_data")
+        print("cannot open build/scores_data")
+        return
+    let ada = db.name_id(players, "Ada")
+    let bo = db.name_id(players, "Bo")
+    var s = Score(key: 1, player: ada, points: 120)
+    db.put(scores, &s as *u8)
+    s = Score(key: 1, player: bo, points: 90)
+    db.put(scores, &s as *u8)
+    s = Score(key: 1, player: ada, points: 80)
+    db.put(scores, &s as *u8)
+    var e: DbEntry
+    let text = "level 1 played twice"
+    db.append(notes, &e as *u8, text.ptr, text.len as int)
+    db.commit()
+
+    var bytes: [..]u8
+    var name: [..]u8
+    defer bytes.free()
+    defer name.free()
+    db.find(scores, 1, &bytes)
+    let found = bytes.ptr as *Score
+    for i in 0..bytes.len / sizeof(Score)
+        db.name_of(players, found[i].player, &name)
+        print("level 1  {str(name[0..name.len])}  {found[i].points}")
+    for i in 0..db.entries(notes)
+        db.read_entry(notes, i as u32, &e as *u8, &bytes)
+        print("note {i}  {str(bytes[0..bytes.len])}")
+    db.close()
+    db.release()

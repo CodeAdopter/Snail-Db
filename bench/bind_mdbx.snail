@@ -1,0 +1,150 @@
+extern include "mdbx_shim.h"
+
+extern type MDBX_env
+extern type MDBX_txn
+extern type MDBX_cursor
+extern type MDBX_dbi = u32
+extern type mdbx_mode_t = u16
+extern type MDBX_env_flags_t = u32
+extern type MDBX_txn_flags_t = u32
+extern type MDBX_db_flags_t = u32
+extern type MDBX_put_flags_t = u32
+
+extern struct MDBX_val
+    iov_base: *void
+    iov_len: u64
+
+extern struct MDBX_version_info
+    major: u16
+    minor: u16
+    patch: u16
+    tweak: u16
+    semver_prerelease: cstr
+    sourcery: cstr
+
+extern const mdbx_version: MDBX_version_info
+extern const MDBX_VERSION_MAJOR: int = 0
+extern const MDBX_VERSION_MINOR: int = 14
+
+extern enum MDBX_cursor_op
+    MDBX_FIRST = 0
+    MDBX_FIRST_DUP = 1
+    MDBX_GET_BOTH = 2
+    MDBX_GET_BOTH_RANGE = 3
+    MDBX_GET_CURRENT = 4
+    MDBX_GET_MULTIPLE = 5
+    MDBX_LAST = 6
+    MDBX_LAST_DUP = 7
+    MDBX_NEXT = 8
+    MDBX_NEXT_DUP = 9
+    MDBX_NEXT_MULTIPLE = 10
+    MDBX_NEXT_NODUP = 11
+    MDBX_PREV = 12
+    MDBX_PREV_DUP = 13
+    MDBX_PREV_NODUP = 14
+    MDBX_SET = 15
+    MDBX_SET_KEY = 16
+    MDBX_SET_RANGE = 17
+    MDBX_PREV_MULTIPLE = 18
+    MDBX_SET_LOWERBOUND = 19
+    MDBX_SET_UPPERBOUND = 20
+
+extern enum MDBX_option_t
+    MDBX_opt_max_db = 0
+    MDBX_opt_max_readers = 1
+    MDBX_opt_sync_bytes = 2
+    MDBX_opt_sync_period = 3
+    MDBX_opt_rp_augment_limit = 4
+    MDBX_opt_loose_limit = 5
+    MDBX_opt_dp_reserve_limit = 6
+    MDBX_opt_txn_dp_limit = 7
+    MDBX_opt_txn_dp_initial = 8
+    MDBX_opt_spill_max_denominator = 9
+    MDBX_opt_spill_min_denominator = 10
+    MDBX_opt_spill_parent4child_denominator = 11
+    MDBX_opt_merge_threshold = 12
+    MDBX_opt_writethrough_threshold = 13
+    MDBX_opt_prefault_write_enable = 14
+
+extern enum MDBX_env_delete_mode_t
+    MDBX_ENV_JUST_DELETE = 0
+    MDBX_ENV_ENSURE_UNUSED = 1
+    MDBX_ENV_WAIT_FOR_UNUSED = 2
+
+extern const MDBX_ENV_DEFAULTS: MDBX_env_flags_t = 0
+extern const MDBX_NOSUBDIR: MDBX_env_flags_t = 0x4000
+extern const MDBX_RDONLY: MDBX_env_flags_t = 0x20000
+extern const MDBX_EXCLUSIVE: MDBX_env_flags_t = 0x400000
+extern const MDBX_WRITEMAP: MDBX_env_flags_t = 0x80000
+extern const MDBX_NOSTICKYTHREADS: MDBX_env_flags_t = 0x200000
+extern const MDBX_NORDAHEAD: MDBX_env_flags_t = 0x800000
+extern const MDBX_NOMEMINIT: MDBX_env_flags_t = 0x1000000
+extern const MDBX_LIFORECLAIM: MDBX_env_flags_t = 0x4000000
+extern const MDBX_SYNC_DURABLE: MDBX_env_flags_t = 0
+extern const MDBX_NOMETASYNC: MDBX_env_flags_t = 0x40000
+extern const MDBX_SAFE_NOSYNC: MDBX_env_flags_t = 0x10000
+extern const MDBX_UTTERLY_NOSYNC: MDBX_env_flags_t = 0x110000
+
+extern const MDBX_TXN_READWRITE: MDBX_txn_flags_t = 0
+extern const MDBX_TXN_RDONLY: MDBX_txn_flags_t = 0x20000
+extern const MDBX_TXN_RDONLY_PREPARE: MDBX_txn_flags_t = 0x1020000
+extern const MDBX_TXN_NOSYNC: MDBX_txn_flags_t = 0x10000
+extern const MDBX_TXN_NOMETASYNC: MDBX_txn_flags_t = 0x40000
+
+extern const MDBX_DB_DEFAULTS: MDBX_db_flags_t = 0
+extern const MDBX_REVERSEKEY: MDBX_db_flags_t = 0x02
+extern const MDBX_INTEGERKEY: MDBX_db_flags_t = 0x08
+extern const MDBX_CREATE: MDBX_db_flags_t = 0x40000
+
+extern const MDBX_UPSERT: MDBX_put_flags_t = 0
+extern const MDBX_NOOVERWRITE: MDBX_put_flags_t = 0x10
+extern const MDBX_CURRENT: MDBX_put_flags_t = 0x40
+extern const MDBX_APPEND: MDBX_put_flags_t = 0x20000
+
+extern const MDBX_SUCCESS: int = 0
+extern const MDBX_RESULT_TRUE: int = -1
+extern const MDBX_KEYEXIST: int = -30799
+extern const MDBX_NOTFOUND: int = -30798
+extern const MDBX_MAP_FULL: int = -30792
+extern const MDBX_READERS_FULL: int = -30790
+extern const MDBX_BAD_TXN: int = -30782
+
+extern fn mdbx_strerror(errnum: int) -> cstr
+
+extern type MDBX_log_level_t = int
+extern type MDBX_debug_flags_t = int
+extern type MDBX_debug_func = *void
+extern const MDBX_LOG_DONTCHANGE: MDBX_log_level_t = -1
+extern const MDBX_LOG_FATAL: MDBX_log_level_t = 0
+extern const MDBX_LOG_ERROR: MDBX_log_level_t = 1
+extern const MDBX_LOG_WARN: MDBX_log_level_t = 2
+extern const MDBX_LOG_NOTICE: MDBX_log_level_t = 3
+extern const MDBX_DBG_DONTCHANGE: MDBX_debug_flags_t = -1
+extern const MDBX_LOGGER_DONTCHANGE: MDBX_debug_func
+extern fn mdbx_setup_debug(level: MDBX_log_level_t, flags: MDBX_debug_flags_t, logger: MDBX_debug_func) -> int
+
+extern fn mdbx_env_create(env: **MDBX_env) -> int
+extern fn mdbx_env_set_geometry(env: *MDBX_env, size_lower: i64, size_now: i64, size_upper: i64, growth_step: i64, shrink_threshold: i64, pagesize: i64) -> int
+extern fn mdbx_env_set_option(env: *MDBX_env, option: MDBX_option_t, value: u64) -> int
+extern fn mdbx_env_set_maxreaders(env: *MDBX_env, readers: u32) -> int
+extern fn mdbx_env_open(env: *MDBX_env, pathname: *u8, flags: MDBX_env_flags_t, mode: mdbx_mode_t) -> int
+extern fn mdbx_env_sync(env: *MDBX_env) -> int
+extern fn mdbx_env_sync_ex(env: *MDBX_env, force: bool, nonblock: bool) -> int
+extern fn mdbx_env_close(env: *MDBX_env) -> int
+extern fn mdbx_env_close_ex(env: *MDBX_env, dont_sync: bool) -> int
+extern fn mdbx_env_delete(pathname: *u8, mode: MDBX_env_delete_mode_t) -> int
+
+extern fn mdbx_txn_begin(env: *MDBX_env, parent: *MDBX_txn, flags: MDBX_txn_flags_t, txn: **MDBX_txn) -> int
+extern fn mdbx_txn_commit(txn: *MDBX_txn) -> int
+extern fn mdbx_txn_abort(txn: *MDBX_txn) -> int
+extern fn mdbx_txn_reset(txn: *MDBX_txn) -> int
+extern fn mdbx_txn_renew(txn: *MDBX_txn) -> int
+
+extern fn mdbx_dbi_open(txn: *MDBX_txn, name: *u8, flags: MDBX_db_flags_t, dbi: *MDBX_dbi) -> int
+extern fn mdbx_get(txn: *MDBX_txn, dbi: MDBX_dbi, key: *MDBX_val, data: *MDBX_val) -> int
+extern fn mdbx_put(txn: *MDBX_txn, dbi: MDBX_dbi, key: *MDBX_val, data: *MDBX_val, flags: MDBX_put_flags_t) -> int
+
+extern fn mdbx_cursor_open(txn: *MDBX_txn, dbi: MDBX_dbi, cursor: **MDBX_cursor) -> int
+extern fn mdbx_cursor_renew(txn: *MDBX_txn, cursor: *MDBX_cursor) -> int
+extern fn mdbx_cursor_get(cursor: *MDBX_cursor, key: *MDBX_val, data: *MDBX_val, op: MDBX_cursor_op) -> int
+extern fn mdbx_cursor_close(cursor: *MDBX_cursor)

@@ -1,0 +1,240 @@
+extern include "db_os.h"
+
+extern fn sn_db_open(path: *u8, len: int, mode: int) -> *void
+extern fn sn_db_size(file: *void) -> i64
+extern fn sn_db_read_at(file: *void, at: i64, buffer: *void, size: i64) -> i64
+extern fn sn_db_write_at(file: *void, at: i64, data: *void, size: i64) -> int
+extern fn sn_db_sync(file: *void) -> int
+extern fn sn_db_truncate(file: *void, size: i64) -> int
+extern fn sn_db_close(file: *void)
+extern fn sn_db_map(file: *void, size: i64, mapping: **void) -> *void
+extern fn sn_db_unmap(view: *void, mapping: *void)
+extern fn sn_db_rename(from: *u8, from_len: int, to: *u8, to_len: int) -> int
+extern fn sn_db_delete(path: *u8, len: int) -> int
+extern fn sn_db_make_folder(path: *u8, len: int) -> int
+extern fn sn_db_read_lock(lock: **void)
+extern fn sn_db_read_unlock(lock: **void)
+extern fn sn_db_write_lock(lock: **void)
+extern fn sn_db_write_unlock(lock: **void)
+extern fn sn_db_wait(cond: **void, lock: **void, ms: int)
+extern fn sn_db_wake(cond: **void)
+extern fn sn_db_unix_ms() -> i64
+extern fn sn_db_last_error() -> int
+extern fn sn_db_list(path: *u8, len: int, out: *u8, room: i64) -> i64
+extern fn sn_db_link(from: *u8, from_len: int, to: *u8, to_len: int) -> int
+extern fn sn_db_enter(slots: *u8, global: *i64) -> *void
+extern fn sn_db_leave(reader: *void)
+extern fn sn_db_retire_epoch(global: *i64) -> i64
+extern fn sn_db_oldest_reader(slots: *u8, global: *i64) -> i64
+extern fn sn_db_top_bit(x: u64) -> int
+extern fn sn_db_load_ptr(p: **void) -> *void
+extern fn sn_db_store_ptr(p: **void, v: *void)
+extern fn sn_db_load_i32(p: *int) -> int
+extern fn sn_db_store_i32(p: *int, v: int)
+extern fn sn_db_seq_begin(seq: *i64) -> i64
+extern fn sn_db_seq_changed(seq: *i64, at: i64) -> bool
+extern fn sn_db_seq_write(seq: *i64)
+extern fn sn_db_seq_written(seq: *i64)
+extern fn sn_db_read_record(to: *u8, from: *u8, size: int, version: *u32, mark: *u8) -> u8
+extern fn sn_db_write_record(to: *u8, from: *u8, size: int, version: *u32, mark: *u8, m: u8)
+
+const DbRead = 0
+const DbCreate = 1
+const DbOpenOrMake = 2
+const DbOpenExisting = 3
+const DbAlone = 4
+
+const DbErrorMissing = 2
+const DbErrorInUse = 32
+const DbErrorDiskFull = 112
+
+var db_failing_write: i64
+var db_writes: i64
+
+fn db_write_allowed() -> bool
+    if db_failing_write == 0: return true
+    return atomic_add(&db_writes, 1) + 1 < db_failing_write
+
+fn db_error_words(code: int) -> str
+    if code == 2: return "no such file"
+    if code == 3: return "no such folder"
+    if code == 5: return "access denied"
+    if code == 32 or code == 33: return "in use by another program"
+    if code == 39 or code == 112: return "disk full"
+    if code == 206: return "path too long"
+    if code == 21: return "device not ready"
+    if code == 23 or code == 1117: return "device error"
+    if code == 0: return "could not read it back"
+    return "system error"
+
+struct DbLock
+    handle: *void
+
+    fn read()
+        sn_db_read_lock(&handle)
+
+    fn read_done()
+        sn_db_read_unlock(&handle)
+
+    fn write()
+        sn_db_write_lock(&handle)
+
+    fn write_done()
+        sn_db_write_unlock(&handle)
+
+struct DbFile
+    handle: *void
+    size: i64
+    error: int
+
+    fn open(path: str, mode: int) -> bool
+        handle = sn_db_open(path.ptr, path.len as int, mode)
+        if not handle
+            error = sn_db_last_error()
+            return false
+        size = sn_db_size(handle)
+        return true
+
+    fn write_at(at: i64, data: *void, count: i64) -> bool
+        if count <= 0: return true
+        if not db_write_allowed()
+            error = DbErrorDiskFull
+            return false
+        if sn_db_write_at(handle, at, data, count) == 0
+            error = sn_db_last_error()
+            return false
+        size = max(size, at + count)
+        return true
+
+    fn append(data: *void, count: i64) -> bool
+        return write_at(size, data, count)
+
+    fn read_at(at: i64, buffer: *void, count: i64) -> bool
+        return sn_db_read_at(handle, at, buffer, count) == count
+
+    fn sync() -> bool
+        if sn_db_sync(handle) != 0: return true
+        error = sn_db_last_error()
+        return false
+
+    fn cut(at: i64) -> bool
+        if sn_db_truncate(handle, at) == 0
+            error = sn_db_last_error()
+            return false
+        size = at
+        return true
+
+    fn close()
+        sn_db_close(handle)
+        handle = null
+
+struct DbPart
+    entries: [..]u8
+    bytes: [..]u8
+    at: i64
+    first: i64
+
+    fn free()
+        entries.free()
+        bytes.free()
+
+fn db_path(out: *[..]u8, folder: str, name: str) -> str
+    out.clear()
+    db_add(out, folder)
+    out.push('/')
+    db_add(out, name)
+    out.push(0)
+    return str(out[0..out.len - 1])
+
+fn db_path_of(out: *[..]u8, folder: str, name: str, ending: str) -> str
+    out.clear()
+    db_add(out, folder)
+    out.push('/')
+    db_add(out, name)
+    db_add(out, ending)
+    out.push(0)
+    return str(out[0..out.len - 1])
+
+fn db_add(out: *[..]u8, s: str)
+    let at = out.len
+    out.resize(at + s.len)
+    copy(&out[at], s.ptr, s.len)
+
+fn db_add_int(out: *[..]u8, n: i64)
+    var digits: [24]u8
+    var v = n < 0 ? -n : n
+    var count = 0
+    loop
+        digits[count] = ('0' + v % 10) as u8
+        count += 1
+        v = v / 10
+        if v == 0: break
+    if n < 0: out.push('-')
+    while count > 0
+        count -= 1
+        out.push(digits[count])
+
+fn db_rename(from: str, to: str) -> bool
+    return sn_db_rename(from.ptr, from.len as int, to.ptr, to.len as int) != 0
+
+fn db_delete(path: str)
+    sn_db_delete(path.ptr, path.len as int)
+
+fn db_copy_part(from: str, to: str, count: i64, ref error: int) -> bool
+    var a: DbFile
+    var b: DbFile
+    if not a.open(from, DbRead)
+        error = a.error
+        return false
+    defer a.close()
+    if not b.open(to, DbCreate)
+        error = b.error
+        return false
+    defer b.close()
+    var buffer: [..]u8
+    defer buffer.free()
+    buffer.resize(min(count, DbCopyChunk))
+    var at: i64 = 0
+    while at < count
+        let n = min(count - at, DbCopyChunk)
+        if not a.read_at(at, buffer.ptr, n) or not b.write_at(at, buffer.ptr, n)
+            error = b.error != 0 ? b.error : sn_db_last_error()
+            return false
+        at += n
+    if not b.sync()
+        error = b.error
+        return false
+    return true
+
+const DbCopyChunk: i64 = 4194304
+
+fn db_list(folder: str, out: *[..]u8) -> bool
+    out.resize(4096)
+    loop
+        let need = sn_db_list(folder.ptr, folder.len as int, out.ptr, out.len as i64)
+        if need < 0
+            out.clear()
+            return false
+        if need <= out.len
+            out.resize(need)
+            return true
+        out.resize(need)
+
+@inline
+fn db_round64(at: i64) -> i64
+    return (at + 63) & ~63
+
+fn db_hash(data: *u8, count: i64) -> u64
+    var h: u64 = 0x9E3779B97F4A7C15 ^ count as u64
+    var i: i64 = 0
+    while i + 8 <= count
+        var w: u64 = 0
+        copy(&w as *u8, data + i, 8)
+        h = (h ^ w) * 0xBF58476D1CE4E5B9
+        h ^= h >> 31
+        i += 8
+    while i < count
+        h = (h ^ data[i]) * 0x94D049BB133111EB
+        i += 1
+    h ^= h >> 29
+    return h * 0x9E3779B97F4A7C15

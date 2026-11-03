@@ -1,0 +1,4 @@
+opens with records of another size false: table rows holds records of 16 bytes, but this program sets it up with 24
+opens with records told apart another way false: table rows tells records apart by 2 bytes after the key, but this program sets it up with 4
+opens a folder in use false: the folder is in use by another program
+opens once it is free true, reads 100

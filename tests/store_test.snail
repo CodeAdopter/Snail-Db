@@ -1,0 +1,775 @@
+use snaildb/snaildb
+
+extern include "test_os.h"
+extern fn sn_test_run(command: *u8, command_len: int, out: *u8, out_len: int, ms: int) -> int
+extern fn sn_test_self(out: *u8, room: int) -> int
+
+const StepMs = 600000
+
+struct Test
+    name: str
+    steps: str
+    want: []u8
+
+fn all_tests(out: *[..]Test)
+    out.push(Test(name: "crash", steps: "crash-write;crash-check", want: embed("crash.out")))
+    out.push(Test(name: "better", steps: "better-write;better-check", want: embed("better.out")))
+    out.push(Test(name: "churn", steps: "churn", want: embed("churn.out")))
+    out.push(Test(name: "race", steps: "race", want: embed("race.out")))
+    out.push(Test(name: "race-update", steps: "race-update", want: embed("race-update.out")))
+    out.push(Test(name: "walk", steps: "walk", want: embed("walk.out")))
+    out.push(Test(name: "fail-log", steps: "fail-log;check", want: embed("fail-log.out")))
+    out.push(Test(name: "fail-flush", steps: "fail-flush;check", want: embed("fail-flush.out")))
+    out.push(Test(name: "fail-retry", steps: "fail-retry;check", want: embed("fail-retry.out")))
+    out.push(Test(name: "setup", steps: "setup", want: embed("setup.out")))
+    out.push(Test(name: "leftovers", steps: "leftovers", want: embed("leftovers.out")))
+    out.push(Test(name: "kept", steps: "kept", want: embed("kept.out")))
+    out.push(Test(name: "remove", steps: "remove-write;remove-check", want: embed("remove.out")))
+    out.push(Test(name: "model", steps: "model", want: embed("model.out")))
+    out.push(Test(name: "model-newest", steps: "model-newest", want: embed("model-newest.out")))
+    out.push(Test(name: "backup", steps: "backup", want: embed("backup.out")))
+    out.push(Test(name: "kv", steps: "kv-write;kv-check", want: embed("kv.out")))
+
+fn is_test(tests: *[..]Test, name: str) -> bool
+    for t in tests[0..tests.len]
+        if t.name == name: return true
+    return false
+
+fn run_tests(tests: *[..]Test) -> int
+    var me: [1024]u8
+    let exe = str(me[0..sn_test_self(&me[0], 1024)])
+    var at = exe.len - 1
+    while at > 0 and exe[at] != '\\': at -= 1
+    let base = exe[0..at]
+    var folder: [..]u8
+    var copies: [..]u8
+    var out: [..]u8
+    var command: [..]u8
+    var got: [..]u8
+    defer folder.free()
+    defer copies.free()
+    defer out.free()
+    defer command.free()
+    defer got.free()
+    var failed = 0
+    for t in tests[0..tests.len]
+        var wanted = arg_count() == 1
+        for a in 1..arg_count()
+            if arg(a) == t.name: wanted = true
+        if not wanted: continue
+        let place = db_path(&folder, base, t.name)
+        empty_folder(place)
+        db_add(&copies, place)
+        db_add(&copies, "-copy")
+        empty_folder(str(copies[0..copies.len]))
+        copies.clear()
+        let output = db_path_of(&out, base, t.name, ".txt")
+        got.clear()
+        var start = 0
+        for i in 0..t.steps.len + 1
+            if i < t.steps.len and t.steps[i] != ';': continue
+            let step = t.steps[start..i]
+            start = i + 1
+            command.clear()
+            db_add(&command, "\"")
+            db_add(&command, exe)
+            db_add(&command, "\" \"")
+            db_add(&command, place)
+            db_add(&command, "\" ")
+            db_add(&command, step)
+            let code = sn_test_run(command.ptr, command.len as int, output.ptr, output.len as int, StepMs)
+            var f: DbFile
+            if f.open(output, DbRead)
+                let start = got.len
+                got.resize(start + f.size)
+                f.read_at(0, &got[start], f.size)
+                f.close()
+            if code != 0
+                db_add(&got, "exit ")
+                db_add_int(&got, code)
+                got.push('\n')
+        db_delete(output)
+        if same_text(str(got[0..got.len]), str(t.want))
+            print("ok    {t.name}")
+        else
+            failed += 1
+            print("FAIL  {t.name}")
+            print("--- got")
+            write(str(got[0..got.len]))
+            print("--- wanted")
+            write(str(t.want))
+    return failed > 0 ? 1 : 0
+
+fn same_text(a: str, b: str) -> bool
+    var i = 0
+    var j = 0
+    loop
+        while i < a.len and a[i] == '\r': i += 1
+        while j < b.len and b[j] == '\r': j += 1
+        if i == a.len or j == b.len: return i == a.len and j == b.len
+        if a[i] != b[j]: return false
+        i += 1
+        j += 1
+
+fn empty_folder(folder: str)
+    var names: [..]u8
+    var p: [..]u8
+    defer names.free()
+    defer p.free()
+    if not db_list(folder, &names): return
+    var start = 0
+    for i in 0..names.len
+        if names[i] != '\n': continue
+        db_delete(db_path(&p, folder, str(names[start..i])))
+        start = i + 1
+
+const CrashCount = 50000
+const ChurnCount = 300000
+const EntryCount = 2000
+
+struct Row
+    key: u64
+    kind: u16
+    depth: u8
+    spare: u8
+    value: i32
+
+fn row_better(a: *u8, b: *u8) -> bool
+    return (a as *Row).depth > (b as *Row).depth
+
+struct Entry
+    at: i64
+    len: u32
+    number: u32
+
+fn mix(x: u64) -> u64
+    var z = x + 0x9E3779B97F4A7C15
+    z = (z ^ z >> 30) * 0xBF58476D1CE4E5B9
+    z = (z ^ z >> 27) * 0x94D049BB133111EB
+    return z ^ z >> 31
+
+fn depth_of(i: i64, round: int) -> int
+    return (mix(i as u64 + round as u64 * 7777) % 40) as int + 1
+
+fn label(out: *[..]u8, word: str, i: int) -> str
+    out.clear()
+    db_add(out, word)
+    db_add_int(out, i)
+    return str(out[0..out.len])
+
+fn rows_of(db: *Db, t: *DbTable, key: u64, out: *[..]Row)
+    var bytes: [..]u8
+    defer bytes.free()
+    db.find(t, key, &bytes)
+    let n = bytes.len / sizeof(Row)
+    out.resize(n)
+    if n > 0: copy(out.ptr as *u8, bytes.ptr, bytes.len)
+
+fn ends(s: str, tail: str) -> bool
+    return s.len >= tail.len and s[s.len - tail.len..s.len] == tail
+
+fn put_rows(db: *Db, rows: *DbTable, from: int, to: int)
+    for i in from..to
+        var r = Row(key: mix(i), kind: 1, depth: 20, value: i as i32 % 1000)
+        db.put(rows, &r as *u8)
+
+fn count_rows(db: *Db, rows: *DbTable, from: int, to: int) -> int
+    var list: [..]Row
+    defer list.free()
+    var found = 0
+    for i in from..to
+        rows_of(db, rows, mix(i), &list)
+        if list.len == 1 and list[0].value == i as i32 % 1000: found += 1
+    return found
+
+fn main()
+    var tests: [..]Test
+    all_tests(&tests)
+    var naming = true
+    for a in 1..arg_count()
+        if not is_test(&tests, arg(a)): naming = false
+    if naming: exit(run_tests(&tests))
+    if arg_count() < 3
+        print("store_test [TEST...] runs tests, store_test FOLDER MODE runs one step")
+        exit(2)
+    let folder = arg(1)
+    let mode = arg(2)
+    if mode == "setup"
+        setup(folder)
+        return
+    if mode == "leftovers"
+        leftovers(folder)
+        return
+    if mode == "kept"
+        kept(folder)
+        return
+    if mode == "model" or mode == "model-newest"
+        model(folder, mode == "model-newest")
+        return
+    if mode == "kv-write" or mode == "kv-check"
+        kv(folder, mode == "kv-write")
+        return
+    var db: Db
+    let rows = db.table("rows", sizeof(Row), 2, row_better)
+    let names = db.name_list("names")
+    let notes = db.journal("notes", sizeof(Entry))
+    if mode == "churn": db.live_most = 2000000
+    if not db.open(folder)
+        print("cannot open")
+        exit(1)
+    if mode == "crash-write"
+        for i in 0..CrashCount
+            var r = Row(key: mix(i), kind: 1, depth: 20, value: i as i32 % 1000)
+            db.put(rows, &r as *u8)
+            if i % 1000 == 999: db.commit()
+        var text: [..]u8
+        for i in 0..EntryCount
+            var e = Entry(number: i as u32)
+            let note = label(&text, "note ", i)
+            db.append(notes, &e as *u8, note.ptr, note.len as int)
+            db.name_id(names, label(&text, "name ", i % 100))
+        text.free()
+        db.commit()
+        print("wrote {CrashCount}")
+        exit(0)
+    if mode == "better-write"
+        for i in 0..1000
+            var r = Row(key: mix(i), kind: 1, depth: 10, value: 1)
+            db.put(rows, &r as *u8)
+        db.commit()
+        var replaced = 0
+        for i in 0..1000
+            var r = Row(key: mix(i), kind: 1, depth: 20, value: 2)
+            if db.put(rows, &r as *u8): replaced += 1
+            r.depth = 5
+            if db.put(rows, &r as *u8): replaced += 1000
+        db.commit()
+        print("better records that changed the table {replaced} of 1000")
+        exit(0)
+    if mode == "better-check"
+        var list: [..]Row
+        var deeper = 0
+        for i in 0..1000
+            rows_of(&db, rows, mix(i), &list)
+            if list.len == 1 and list[0].depth == 20 and list[0].value == 2: deeper += 1
+        print("better records kept through a crash {deeper} of 1000")
+        list.free()
+    if mode == "remove-write"
+        put_rows(&db, rows, 0, 1000)
+        db.commit()
+        db.flush_now()
+        for i in 0..500
+            var r = Row(key: mix(i), kind: 1)
+            db.remove(rows, &r as *u8)
+        put_rows(&db, rows, 1000, 1100)
+        for i in 1000..1050
+            var r = Row(key: mix(i), kind: 1)
+            db.remove(rows, &r as *u8)
+        db.commit()
+        print("kept {count_rows(&db, rows, 0, 1100)} of 1100 after removing 550")
+        exit(0)
+    if mode == "backup"
+        put_rows(&db, rows, 0, 5000)
+        var text: [..]u8
+        for i in 0..300
+            var e = Entry(number: i as u32)
+            let note = label(&text, "note ", i)
+            db.append(notes, &e as *u8, note.ptr, note.len as int)
+            db.name_id(names, label(&text, "name ", i % 100))
+        db.commit()
+        db.flush_now()
+        put_rows(&db, rows, 5000, 6000)
+        var copy: [..]u8
+        db_add(&copy, folder)
+        db_add(&copy, "-copy")
+        let to = str(copy[0..copy.len])
+        print("backed up {db.backup(to)}")
+        put_rows(&db, rows, 6000, 7000)
+        for i in 0..100
+            var r = Row(key: mix(i), kind: 1)
+            db.remove(rows, &r as *u8)
+        db.close()
+        var back: Db
+        let back_rows = back.table("rows", sizeof(Row), 2, row_better)
+        let back_names = back.name_list("names")
+        let back_notes = back.journal("notes", sizeof(Entry))
+        print("backup opens {back.open(to)}, rows {count_rows(&back, back_rows, 0, 7000)} of 6000, names {back.known_id(back_names, "name 99")}, notes {back.entries(back_notes)}")
+        check_notes(&back, back_notes)
+        back.close()
+        back.release()
+        text.free()
+        copy.free()
+        return
+    if mode == "remove-check"
+        print("kept {count_rows(&db, rows, 0, 1100)} of 1100 through a crash, removed ones back {count_rows(&db, rows, 0, 500) + count_rows(&db, rows, 1000, 1050)}")
+    if mode == "crash-check"
+        var list: [..]Row
+        var found = 0
+        for i in 0..CrashCount
+            rows_of(&db, rows, mix(i), &list)
+            if list.len == 1 and list[0].value == i as i32 % 1000: found += 1
+        print("found {found} of {CrashCount}")
+        list.free()
+        check_notes(&db, notes)
+        var good = 0
+        var name: [..]u8
+        var want: [..]u8
+        defer name.free()
+        defer want.free()
+        for i in 0..100
+            let id = db.known_id(names, label(&want, "name ", i))
+            db.name_of(names, id, &name)
+            if id == i as u32 + 1 and str(name[0..name.len]) == str(want[0..want.len]): good += 1
+        print("names kept {good} of 100")
+    elif mode == "fail-log"
+        put_rows(&db, rows, 0, 1000)
+        print("commit {db.commit()}")
+        db_writes = 0
+        db_failing_write = 1
+        put_rows(&db, rows, 1000, 1010)
+        print("commit after a failed write {db.commit()}, says the log is full {ends(db.error, "/wal: disk full")}")
+        var r = Row(key: 1, kind: 1, depth: 20)
+        print("takes writes after {db.put(rows, &r as *u8)}, still reads {count_rows(&db, rows, 0, 1010)}")
+        db_failing_write = 0
+    elif mode == "fail-flush" or mode == "fail-retry"
+        put_rows(&db, rows, 0, 20000)
+        db.commit()
+        db_writes = 0
+        db_failing_write = 2
+        db.flush_now()
+        print("write-out kept back {db.pending}, says why {ends(db.error, ".seg: disk full")}, still reads {count_rows(&db, rows, 0, 20000)}")
+        db_failing_write = 0
+        if mode == "fail-flush": exit(0)
+        db.flush_now()
+        print("tried again and wrote {not db.pending}, segments {rows.segments.len}, still reads {count_rows(&db, rows, 0, 20000)}")
+    elif mode == "check"
+        print("found {count_rows(&db, rows, 0, 20000)} committed, error after opening '{db.error}'")
+    elif mode == "churn"
+        churn(&db, rows)
+    elif mode == "race"
+        race(&db, rows)
+    elif mode == "race-update"
+        race_update(&db, rows)
+    elif mode == "walk"
+        walk(&db, rows)
+    db.close()
+    db.release()
+
+fn check_notes(db: *Db, notes: *DbJournal)
+    var e: Entry
+    var bytes: [..]u8
+    var want: [..]u8
+    defer bytes.free()
+    defer want.free()
+    var good = 0
+    let n = db.entries(notes)
+    for i in 0..n
+        if not db.read_entry(notes, i as u32, &e as *u8, &bytes): continue
+        if e.number == i as u32 and str(bytes[0..bytes.len]) == label(&want, "note ", i): good += 1
+    print("entries kept {good} of {n}")
+
+fn churn(db: *Db, rows: *DbTable)
+    for round in 0..3
+        for i in 0..ChurnCount
+            var r = Row(key: mix(i), kind: (i % 3 + 1) as u16, depth: depth_of(i, round) as u8, value: round)
+            db.put(rows, &r as *u8)
+            if i % 5000 == 4999: db.commit()
+    db.commit()
+    db.settle()
+    print("written out in several rounds {db.flush_round > 1}, at most {DbMergeAbove + 1} segments {rows.segments.len <= DbMergeAbove + 1}, checksums match {db.verify()}")
+    check_churn(db, rows)
+    var path: [..]u8
+    db_add(&path, str(db.folder[0..db.folder.len]))
+    db.close()
+    if not db.open(str(path[0..path.len]))
+        print("cannot reopen")
+        return
+    path.free()
+    check_churn(db, rows)
+
+fn check_churn(db: *Db, rows: *DbTable)
+    var list: [..]Row
+    defer list.free()
+    var good = 0
+    for i in 0..ChurnCount
+        rows_of(db, rows, mix(i), &list)
+        var want = 0
+        for round in 0..3: want = max(want, depth_of(i, round))
+        if list.len == 1 and list[0].depth == want and list[0].kind == (i % 3 + 1) as u16: good += 1
+    var stray = 0
+    for i in ChurnCount..ChurnCount * 2
+        rows_of(db, rows, mix(i), &list)
+        stray += list.len
+    print("deepest kept for {good} of {ChurnCount}, records found for absent keys {stray}")
+
+struct Reader
+    db: *Db
+    rows: *DbTable
+    @volatile stop: int
+    bad: int
+    seen: i64
+
+fn read_work(r: *Reader)
+    var list: [..]Row
+    defer list.free()
+    var i: u64 = 0
+    while r.stop == 0
+        let k = i % 200000
+        rows_of(r.db, r.rows, mix(k), &list)
+        for e in list
+            if e.key != mix(k) or e.value != (k % 1000) as i32
+                if r.bad < 3 and arg_count() > 3: print("bad: want key {mix(k):016X} value {k % 1000}, got key {e.key:016X} kind {e.kind} depth {e.depth} value {e.value}, {list.len} records")
+                r.bad += 1
+        if list.len > 1
+            if r.bad < 3 and arg_count() > 3: print("bad: {list.len} records for key {mix(k):016X}")
+            r.bad += 1
+        r.seen += list.len
+        i += 7
+
+fn race(db: *Db, rows: *DbTable)
+    db.live_most = 4000000
+    var readers: [3]Reader
+    var threads: [3]u64
+    for k in 0..3
+        readers[k].db = db
+        readers[k].rows = rows
+        threads[k] = spawn(read_work, &readers[k])
+    for i in 0..200000
+        var r = Row(key: mix(i), kind: 1, depth: 10, value: i as i32 % 1000)
+        db.put(rows, &r as *u8)
+        if i % 500 == 499: db.commit()
+    db.commit()
+    sleep_ms(200)
+    var bad = 0
+    var any = true
+    for k in 0..3
+        atomic_store(&readers[k].stop, 1)
+        join(threads[k])
+        bad += readers[k].bad
+        if readers[k].seen == 0: any = false
+    print("readers saw records {any}, wrong records {bad}, rounds written out while they read {db.flush_round > 0}")
+
+fn walk(db: *Db, rows: *DbTable)
+    db.live_most = 1000000
+    let n = 50000
+    for round in 0..2
+        for i in 0..n
+            for kind in 1..3
+                var r = Row(key: mix(i), kind: kind as u16, depth: (10 + round * 5) as u8, value: round)
+                db.put(rows, &r as *u8)
+        db.commit()
+        if round == 0: db.flush_now()
+    var w: Walker
+    db.each(rows, |rec| w.visit(rec as *Row))
+    print("walked {w.count} of {n * 2}, in order {w.ordered}, deepest {w.deepest}")
+
+struct Walker
+    count: int
+    ordered: bool = true
+    deepest: bool = true
+    last_key: u64
+    last_kind: int
+
+    fn visit(r: *Row)
+        if count > 0 and (r.key < last_key or (r.key == last_key and r.kind as int <= last_kind)): ordered = false
+        if r.depth != 15: deepest = false
+        last_key = r.key
+        last_kind = r.kind as int
+        count += 1
+
+fn exists(folder: str, name: str) -> bool
+    var p: [..]u8
+    defer p.free()
+    var f: DbFile
+    if not f.open(db_path(&p, folder, name), DbRead): return false
+    f.close()
+    return true
+
+fn setup(folder: str)
+    var first: Db
+    let rows = first.table("rows", sizeof(Row), 2, row_better)
+    first.open(folder)
+    put_rows(&first, rows, 0, 100)
+    first.close()
+    var bigger: Db
+    bigger.table("rows", sizeof(Row) + 8, 2, row_better)
+    print("opens with records of another size {bigger.open(folder)}: {bigger.error}")
+    var other: Db
+    other.table("rows", sizeof(Row), 4, row_better)
+    print("opens with records told apart another way {other.open(folder)}: {other.error}")
+    first.open(folder)
+    var second: Db
+    let again = second.table("rows", sizeof(Row), 2, row_better)
+    print("opens a folder in use {second.open(folder)}: {second.error}")
+    first.close()
+    print("opens once it is free {second.open(folder)}, reads {count_rows(&second, again, 0, 100)}")
+    second.close()
+    first.release()
+    bigger.release()
+    other.release()
+    second.release()
+
+fn leftovers(folder: str)
+    var db: Db
+    let rows = db.table("rows", sizeof(Row), 2, row_better)
+    db.open(folder)
+    put_rows(&db, rows, 0, 100)
+    db.close()
+    var p: [..]u8
+    defer p.free()
+    for name in ["rows-77.seg", "MANIFEST.new", "other-5.seg"]
+        var f: DbFile
+        f.open(db_path(&p, folder, name), DbCreate)
+        f.append("junk".ptr, 4)
+        f.close()
+    db.open(folder)
+    print("reads {count_rows(&db, rows, 0, 100)}, stray segment gone {not exists(folder, "rows-77.seg")}, stray manifest gone {not exists(folder, "MANIFEST.new")}, unknown table's segment kept {exists(folder, "other-5.seg")}")
+    db.close()
+    db.release()
+
+fn kept(folder: str)
+    var both: Db
+    let rows = both.table("rows", sizeof(Row), 2, row_better)
+    let extra = both.table("extra", sizeof(Row), 2, row_better)
+    both.open(folder)
+    put_rows(&both, rows, 0, 100)
+    put_rows(&both, extra, 0, 100)
+    both.close()
+    var one: Db
+    let only = one.table("rows", sizeof(Row), 2, row_better)
+    one.open(folder)
+    put_rows(&one, only, 100, 200)
+    one.close()
+    one.open(folder)
+    one.close()
+    both.open(folder)
+    print("rows {count_rows(&both, rows, 0, 200)} of 200, extra {count_rows(&both, extra, 0, 100)} of 100")
+    both.close()
+    both.release()
+    one.release()
+
+const ModelKeys = 2000
+const ModelOps = 200000
+
+fn model_better(a: *u8, b: *u8) -> bool
+    let x = a as *Row
+    let y = b as *Row
+    if x.depth != y.depth: return x.depth > y.depth
+    return x.value > y.value
+
+struct Model
+    present: [..]bool
+    depth: [..]u8
+    value: [..]i32
+    keys: [..]u64
+    order: [..]u32
+    bad: int
+    range_bad: int
+    trace: bool
+    step: int
+
+    fn key_of(id: int) -> u64
+        return mix((id / 3 + 7000000) as u64)
+
+    fn record(id: int) -> Row
+        return Row(key: key_of(id), kind: (id % 3 + 1) as u16, depth: depth[id], value: value[id])
+
+    fn check_key(db: *Db, rows: *DbTable, k: int, list: *[..]Row)
+        let before = bad
+        rows_of(db, rows, key_of(k * 3), list)
+        var want = 0
+        for kind in 0..3
+            let id = k * 3 + kind
+            if not present[id]: continue
+            want += 1
+            var seen = false
+            for r in list[0..list.len]
+                if r.kind as int == kind + 1 and r.depth == depth[id] and r.value == value[id]: seen = true
+            if not seen: bad += 1
+        if list.len != want: bad += 1
+        if trace and bad > before and before < 4
+            write("step {step} key {k}: want")
+            for kind in 0..3
+                if present[k * 3 + kind]: write(" ({kind + 1} {depth[k * 3 + kind]} {value[k * 3 + kind]})")
+            write(" got")
+            for r in list[0..list.len]: write(" ({r.kind} {r.depth} {r.value})")
+            print("")
+
+    fn check_range(db: *Db, rows: *DbTable, from: u64, to: u64)
+        var got: [..]Row
+        defer got.free()
+        db.range(rows, from, to, |r| got.push((r as *Row)[0]))
+        var at = 0
+        for j in 0..keys.len
+            if keys[j] < from or keys[j] > to: continue
+            let k = order[j] as int
+            for kind in 0..3
+                let id = k * 3 + kind
+                if not present[id]: continue
+                if at >= got.len: bad += 1
+                elif got[at].key != keys[j] or got[at].kind as int != kind + 1 or got[at].depth != depth[id] or got[at].value != value[id]
+                    if trace and range_bad < 4: print("step {step} walk at {at}: want key {keys[j]:016X} kind {kind + 1} depth {depth[id]} value {value[id]}, got key {got[at].key:016X} kind {got[at].kind} depth {got[at].depth} value {got[at].value}")
+                    if trace: range_bad += 1
+                    bad += 1
+                at += 1
+        if at != got.len: bad += 1
+        if trace and at != got.len and range_bad < 4: print("step {step} range {from:016X}..{to:016X}: want {at} got {got.len}")
+        if at != got.len: range_bad += 1
+
+fn model(folder: str, newest: bool)
+    var db: Db
+    let rows = newest ? db.newest_table("rows", sizeof(Row), 2) : db.table("rows", sizeof(Row), 2, model_better)
+    db.live_most = 65536
+    db.open(folder)
+    var m: Model
+    m.present.resize(ModelKeys * 3)
+    m.depth.resize(ModelKeys * 3)
+    m.value.resize(ModelKeys * 3)
+    for k in 0..ModelKeys
+        m.keys.push(m.key_of(k * 3))
+        m.order.push(k as u32)
+    db_sort_pairs(&m.keys, &m.order)
+    var list: [..]Row
+    defer list.free()
+    var rng: u64 = arg_count() > 3 ? parse_int(arg(3)) as u64 : 12345
+    var reopened = 0
+    m.trace = arg_count() > 4
+    for op in 0..ModelOps
+        m.step = op
+        rng = mix(rng)
+        let id = (rng % (ModelKeys * 3) as u64) as int
+        let choice = (rng >> 32) % 1000
+        if choice < 600
+            var r = Row(key: m.key_of(id), kind: (id % 3 + 1) as u16, depth: ((rng >> 42) % 40 + 1) as u8, value: op)
+            db.put(rows, &r as *u8)
+            var held = m.record(id)
+            if not m.present[id] or newest or model_better(&r as *u8, &held as *u8)
+                m.present[id] = true
+                m.depth[id] = r.depth
+                m.value[id] = r.value
+        elif choice < 800
+            var r = Row(key: m.key_of(id), kind: (id % 3 + 1) as u16)
+            db.remove(rows, &r as *u8)
+            m.present[id] = false
+        elif choice < 960
+            m.check_key(&db, rows, id / 3, &list)
+        elif choice < 985
+            let from = mix(rng ^ 77)
+            m.check_range(&db, rows, from, from + (rng >> 4))
+        elif choice < 998
+            db.commit()
+        elif choice < 999
+            if rng >> 60 < 4: db.compact(rows)
+            else: db.settle()
+        else
+            db.close()
+            db.open(folder)
+            reopened += 1
+    for k in 0..ModelKeys: m.check_key(&db, rows, k, &list)
+    m.check_range(&db, rows, 0, 0xFFFFFFFFFFFFFFFF)
+    db.compact(rows)
+    let compacted = rows.segments.len == 1 and not rows.segments[0].marks
+    for k in 0..ModelKeys: m.check_key(&db, rows, k, &list)
+    print("model {ModelOps} steps, reopened often {reopened > 50}, written out often {db.flush_round > 100}, merged {db.merges > 10}, compacted to one segment without removals {compacted}, wrong answers {m.bad}")
+    db.close()
+    db.release()
+
+fn text_of(list: *[..]u8) -> str
+    return str(list[0..list.len])
+
+fn kv(folder: str, writing: bool)
+    var db: Db
+    let settings = db.kv("settings", 64)
+    db.live_most = 65536
+    db.open(folder)
+    var out: [..]u8
+    var key: [..]u8
+    defer out.free()
+    defer key.free()
+    if writing
+        db.set(settings, "theme", "dark" as []u8)
+        db.set(settings, "volume", "80" as []u8)
+        db.set(settings, "name", "Ada" as []u8)
+        db.flush_now()
+        db.set(settings, "theme", "light" as []u8)
+        db.unset(settings, "volume")
+        let long = db.set(settings, "story", "a value much longer than the sixty four bytes this store holds for each" as []u8)
+        for i in 0..20000
+            let v = label(&out, "value ", i)
+            db.set(settings, label(&key, "key ", i), v as []u8)
+        for i in 0..20000: db.set(settings, label(&key, "key ", i), label(&out, "again ", i) as []u8)
+        db.commit()
+        print("too long a value refused {not long}")
+    let theme = db.get(settings, "theme", &out)
+    write("theme {theme} {text_of(&out)}, ")
+    let volume = db.get(settings, "volume", &out)
+    write("volume kept {volume}, ")
+    db.get(settings, "name", &out)
+    print("name {text_of(&out)}")
+    var good = 0
+    var want: [..]u8
+    defer want.free()
+    for i in 0..20000
+        if db.get(settings, label(&key, "key ", i), &out) and text_of(&out) == label(&want, "again ", i): good += 1
+    var walked = 0
+    db.each_kv(settings, |k, v| walked += 1)
+    print("keys with their newest value {good} of 20000, walked {walked}")
+    if writing: exit(0)
+    db.close()
+    db.release()
+
+const UpdateKeys = 50000
+
+fn update_row(k: int, depth: int) -> Row
+    let key = mix(k as u64 + 900000)
+    return Row(key: key, kind: 1, depth: depth as u8, value: (key & 0xFFFF) as i32 * 256 + depth)
+
+fn update_read(r: *Reader)
+    var list: [..]Row
+    defer list.free()
+    var i: u64 = 0
+    while r.stop == 0
+        let k = (i % UpdateKeys as u64) as int
+        rows_of(r.db, r.rows, mix(k as u64 + 900000), &list)
+        if list.len > 1: r.bad += 1
+        for e in list
+            if e.key != mix(k as u64 + 900000) or e.value != (e.key & 0xFFFF) as i32 * 256 + e.depth as i32
+                if r.bad < 3 and arg_count() > 3: print("bad: key {e.key:016X} depth {e.depth} value {e.value}")
+                r.bad += 1
+        r.seen += list.len
+        i += 13
+
+fn race_update(db: *Db, rows: *DbTable)
+    db.live_most = 2000000
+    var readers: [3]Reader
+    var threads: [3]u64
+    for k in 0..3
+        readers[k].db = db
+        readers[k].rows = rows
+        threads[k] = spawn(update_read, &readers[k])
+    for depth in 1..200
+        for k in 0..UpdateKeys
+            var row = update_row(k, depth)
+            db.put(rows, &row as *u8)
+        if depth % 20 == 0
+            for k in 0..UpdateKeys / 10
+                var gone = update_row(k * 10, depth)
+                db.remove(rows, &gone as *u8)
+            for k in 0..UpdateKeys / 10
+                var back = update_row(k * 10, depth)
+                db.put(rows, &back as *u8)
+        db.commit()
+    var bad = 0
+    var seen: i64 = 0
+    for k in 0..3
+        atomic_store(&readers[k].stop, 1)
+        join(threads[k])
+        bad += readers[k].bad
+        seen += readers[k].seen
+    var deepest = 0
+    var list: [..]Row
+    for k in 0..UpdateKeys
+        rows_of(db, rows, mix(k as u64 + 900000), &list)
+        if list.len == 1 and list[0].depth == 199: deepest += 1
+    list.free()
+    print("readers saw records {seen > 0}, wrong records {bad}, written out {db.flush_round > 5}, deepest kept {deepest} of {UpdateKeys}")

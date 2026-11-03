@@ -1,0 +1,225 @@
+use snaildb/db_memtable
+use snaildb/db_segment
+
+struct DbTable
+    name: str
+    tag: u8
+    size: int
+    same: int
+    better: extern fn(*u8, *u8) -> bool
+    newest: bool
+    live: *DbMem
+    frozen: *DbMem
+    segments: [..]*DbSegment
+    view: *DbView
+    seq: i64
+
+    fn setup(table_name: str, table_tag: u8, record_size: int, same_bytes: int, keep: extern fn(*u8, *u8) -> bool)
+        name = table_name
+        tag = table_tag
+        size = record_size
+        same = same_bytes
+        better = keep
+        start()
+
+    fn start()
+        live = db_mem(size)
+        frozen = db_mem(size)
+        view = new DbView
+
+    fn put(rec: *u8, mark: u8) -> bool
+        return live.put(rec, newest ? mark | DbShadow : mark, same, better)
+
+    fn find(key: u64, out: *[..]u8, scratch: *u8)
+        loop
+            let at = sn_db_seq_begin(&seq)
+            out.clear()
+            let l = sn_db_load_ptr(&live as **void) as *DbMem
+            let f = sn_db_load_ptr(&frozen as **void) as *DbMem
+            let v = sn_db_load_ptr(&view as **void) as *DbView
+            l.find(key, out, same, better, scratch)
+            f.find(key, out, same, better, scratch)
+            var i = v.list.len - 1
+            while i >= 0
+                v.list[i].find_marked(key, out, better)
+                i -= 1
+            if not sn_db_seq_changed(&seq, at): break
+        db_unmark(out, size)
+
+    fn publish_view() -> *DbView
+        var v = new DbView
+        for s in segments: v.list.push(s)
+        let old = view
+        sn_db_store_ptr(&view as **void, v)
+        return old
+
+    fn records() -> i64
+        var n = live.count as i64 + frozen.count as i64
+        for s in segments: n += s.count
+        return n
+
+    fn freeze()
+        sn_db_seq_write(&seq)
+        let empty = frozen
+        sn_db_store_ptr(&frozen as **void, live)
+        sn_db_store_ptr(&live as **void, empty)
+        sn_db_seq_written(&seq)
+
+    fn install(s: *DbSegment, old_view: **DbView) -> *DbMem
+        segments.push(s)
+        sn_db_seq_write(&seq)
+        old_view[0] = publish_view()
+        let written = frozen
+        sn_db_store_ptr(&frozen as **void, db_mem(size))
+        sn_db_seq_written(&seq)
+        return written
+
+    fn write_frozen(path: str, number: int, ref error: int) -> *DbSegment
+        let n = frozen.count
+        var keys: [..]u64
+        var order: [..]u32
+        defer keys.free()
+        defer order.free()
+        keys.resize(n)
+        order.resize(n)
+        for i in 0..n
+            keys[i] = frozen.key_of(i)
+            order[i] = i as u32
+        if n > 0: db_sort_pairs(&keys, &order)
+        if same > 0: frozen.order_runs(&keys, &order, same)
+        var w: DbSegWriter
+        w.begin(path, size, same, n)
+        for i in 0..n
+            let at = order[i] as int
+            w.add(frozen.record(at), frozen.mark_of(at))
+        if not w.finish()
+            error = w.file.error
+            db_delete(path)
+            return null
+        var why = DbSegOk
+        let s = open_segment(path, number, ref why)
+        if not s
+            error = 0
+            db_delete(path)
+        return s
+
+    fn open_segment(path: str, number: int, ref why: int) -> *DbSegment
+        var s = new DbSegment
+        why = s.open(path, size, same)
+        if why != DbSegOk
+            free(s)
+            return null
+        s.number = number
+        return s
+
+    fn runs_of(list: []*DbSegment, from: u64, to: u64, runs: *[..]DbRun, held: *DbCopy)
+        runs.clear()
+        for s in list
+            let start = s.first_of(from)
+            var end = start
+            if to == 0xFFFFFFFFFFFFFFFF: end = s.count
+            else: end = s.first_of(to + 1)
+            if end > start: runs.push(s.run(start, end))
+        frozen.copy_range(from, to, &held.frozen, &held.frozen_marks)
+        live.copy_range(from, to, &held.live, &held.live_marks)
+
+    fn add_copies(runs: *[..]DbRun, held: *DbCopy)
+        let f = db_sort_run(&held.frozen, &held.frozen_marks, size, same)
+        if f.count > 0: runs.push(f)
+        let l = db_sort_run(&held.live, &held.live_marks, size, same)
+        if l.count > 0: runs.push(l)
+
+    fn merge(runs: []DbRun, emit: fn(*u8, u8), stop: *int, oldest: bool) -> bool
+        let k = runs.len
+        if k <= 0: return true
+        var at: [..]i64
+        defer at.free()
+        at.resize(k)
+        var pending: [..]u8
+        defer pending.free()
+        pending.resize(size)
+        var mark: u8 = 0
+        var have = false
+        var steps = 0
+        loop
+            steps += 1
+            if steps & 0xFFFF == 0 and atomic_load(stop) != 0: return false
+            var pick = -1
+            var pick_rec: *u8 = null
+            var j = k - 1
+            while j >= 0
+                if at[j] < runs[j].count
+                    let r = runs[j].record(at[j])
+                    if pick < 0 or db_before(r, pick_rec, same)
+                        pick = j
+                        pick_rec = r
+                j -= 1
+            if pick < 0: break
+            let m = runs[pick].mark(at[pick])
+            at[pick] += 1
+            if have and db_same(pending.ptr, pick_rec, same)
+                if mark & DbClosed != 0: continue
+                if m & DbDead != 0
+                    mark |= DbClosed
+                    continue
+                if better(pick_rec, pending.ptr): copy(pending.ptr, pick_rec, size)
+                if m & DbShadow != 0: mark |= DbClosed
+                continue
+            if have: hand_on(pending.ptr, mark, emit, oldest)
+            copy(pending.ptr, pick_rec, size)
+            mark = db_opened(m)
+            have = true
+        if have: hand_on(pending.ptr, mark, emit, oldest)
+        return true
+
+    fn hand_on(rec: *u8, mark: u8, emit: fn(*u8, u8), oldest: bool)
+        if oldest
+            if mark & DbDead == 0: emit(rec, 0)
+        elif mark & DbDead != 0: emit(rec, DbDead | DbShadow)
+        else: emit(rec, mark & DbClosed != 0 ? DbShadow : 0)
+
+    fn disk_bytes() -> i64
+        var n: i64 = 0
+        for s in segments: n += s.file.size
+        return n
+
+    fn close()
+        for s in segments
+            s.close()
+            free(s)
+        segments.free()
+        live.release()
+        frozen.release()
+        free(live)
+        free(frozen)
+        view.list.free()
+        free(view)
+        start()
+
+struct DbView
+    list: [..]*DbSegment
+
+struct DbCopy
+    frozen: [..]u8
+    frozen_marks: [..]u8
+    live: [..]u8
+    live_marks: [..]u8
+
+    fn free()
+        frozen.free()
+        frozen_marks.free()
+        live.free()
+        live_marks.free()
+
+fn db_newest(a: *u8, b: *u8) -> bool
+    return true
+
+fn db_keep_first(a: *u8, b: *u8) -> bool
+    return false
+
+@inline
+fn db_before(a: *u8, b: *u8, same: int) -> bool
+    let x = (a as *u64)[0]
+    let y = (b as *u64)[0]
+    if x != y: return x < y
+    return same > 0 and db_memcmp(a + 8, b + 8, same as u64) < 0

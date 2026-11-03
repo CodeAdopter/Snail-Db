@@ -1,0 +1,106 @@
+extern "memcmp" fn db_memcmp(a: *void, b: *void, count: u64) -> int
+extern "memmove" fn db_memmove(to: *void, from: *void, count: u64) -> *void
+
+fn db_sort_pairs(keys: *[..]u64, numbers: *[..]u32)
+    let n = keys.len
+    var other_keys: [..]u64
+    var other_numbers: [..]u32
+    defer other_keys.free()
+    defer other_numbers.free()
+    other_keys.resize(n)
+    other_numbers.resize(n)
+    var counts = alloc[i64](65536)
+    defer free(counts)
+    var from_keys = keys.ptr
+    var from_numbers = numbers.ptr
+    var to_keys = other_keys.ptr
+    var to_numbers = other_numbers.ptr
+    var shift = 0
+    while shift < 64
+        zero(counts, 65536)
+        for i in 0..n
+            counts[from_keys[i] >> shift & 0xFFFF] += 1
+        var skip = false
+        let first = from_keys[0] >> shift & 0xFFFF
+        if n > 0 and counts[first] == n: skip = true
+        if not skip
+            var total: i64 = 0
+            for d in 0..65536
+                let c = counts[d]
+                counts[d] = total
+                total += c
+            for i in 0..n
+                let k = from_keys[i]
+                let d = k >> shift & 0xFFFF
+                let at = counts[d]
+                counts[d] = at + 1
+                to_keys[at] = k
+                to_numbers[at] = from_numbers[i]
+            let swap_keys = from_keys
+            from_keys = to_keys
+            to_keys = swap_keys
+            let swap_numbers = from_numbers
+            from_numbers = to_numbers
+            to_numbers = swap_numbers
+        shift += 16
+    if from_keys != keys.ptr
+        copy(keys.ptr, from_keys, n)
+        copy(numbers.ptr, from_numbers, n)
+
+@inline
+fn db_same(a: *u8, b: *u8, same: int) -> bool
+    if (a as *u64)[0] != (b as *u64)[0]: return false
+    return same == 0 or db_memcmp(a + 8, b + 8, same as u64) == 0
+
+const DbDead: u8 = 1
+const DbShadow: u8 = 2
+const DbClosed: u8 = 4
+
+fn db_keep_marked(out: *[..]u8, rec: *u8, mark: u8, size: int, same: int, better: extern fn(*u8, *u8) -> bool)
+    let stride = size + 1
+    let n = out.len / stride
+    for j in 0..n
+        let r = &out[j * stride]
+        if db_same(r, rec, same)
+            let m = r + size
+            if m[0] & DbClosed != 0: return
+            if mark & DbDead != 0
+                m[0] |= DbClosed
+                return
+            if better(rec, r): copy(r, rec, size)
+            if mark & DbShadow != 0: m[0] |= DbClosed
+            return
+    let at = out.len
+    out.resize(at + stride)
+    copy(&out[at], rec, size)
+    out[at + size] = db_opened(mark)
+
+@inline
+fn db_opened(mark: u8) -> u8
+    if mark & DbDead != 0: return DbDead | DbClosed
+    return mark & DbShadow != 0 ? DbClosed : 0
+
+fn db_unmark(out: *[..]u8, size: int)
+    let stride = size + 1
+    let n = out.len / stride
+    var kept = 0
+    for j in 0..n
+        let r = &out[j * stride]
+        if r[size] & DbDead != 0: continue
+        if j > 0: copy(&out[kept * size], r, size)
+        kept += 1
+    out.resize(kept * size)
+
+struct DbRun
+    records: *u8
+    count: i64
+    size: int
+    marks: *u8
+
+    @inline
+    fn record(i: i64) -> *u8
+        return records + i * size
+
+    @inline
+    fn mark(i: i64) -> u8
+        return marks ? marks[i] : 0

@@ -1,0 +1,242 @@
+use snaildb/db_os
+use snaildb/db_sort
+
+const DbSegMagic: u64 = 0x31474553424443
+const DbSegMagic2: u64 = 0x32474553424443
+const DbSegHeader = 64
+const DbWriteChunk = 4194304
+const DbSumBlock = 65536
+const DbFilterBits = 10
+
+const DbSegOk = 0
+const DbSegUnread = 1
+const DbSegDamaged = 2
+const DbSegOtherSize = 3
+const DbSegOtherSame = 4
+
+const DbFilterSalts: [8]u32 = [0x47B6137B, 0x44974D91, 0x8824AD5B, 0xA2B7289D, 0x705495C7, 0x2DF1424B, 0x9EFC4947, 0x5C6BFB31]
+
+struct DbSegment
+    number: int
+    size: int
+    same: int
+    count: i64
+    file: DbFile
+    mapping: *void
+    view: *u8
+    filter: *u32
+    blocks: u64
+    sums: *u64
+    sum_count: i64
+    marks: *u8
+
+    @inline
+    fn record(i: i64) -> *u8
+        return view + DbSegHeader + i * size
+
+    @inline
+    fn key_at(i: i64) -> u64
+        return (record(i) as *u64)[0]
+
+    fn open(path: str, record_size: int, same_bytes: int) -> int
+        size = record_size
+        same = same_bytes
+        if not file.open(path, DbRead): return DbSegUnread
+        if file.size < DbSegHeader
+            file.close()
+            return DbSegDamaged
+        view = sn_db_map(file.handle, file.size, &mapping) as *u8
+        if not view
+            file.error = sn_db_last_error()
+            file.close()
+            return DbSegUnread
+        let why = check()
+        if why != DbSegOk: close()
+        return why
+
+    fn check() -> int
+        let head = view as *u64
+        count = head[2] as i64
+        if head[0] == DbSegMagic2
+            if db_hash(view, 56) != head[7]: return DbSegDamaged
+            blocks = head[4]
+            sum_count = head[5] as i64
+            let filter_at = db_round64(DbSegHeader + count * head[1] as i64)
+            let sums_at = filter_at + blocks as i64 * 32
+            let marks_at = sums_at + sum_count * 8
+            let marks_end = head[6] != 0 ? marks_at + count : marks_at
+            if count < 0 or sum_count < 0 or marks_end > file.size: return DbSegDamaged
+            filter = (view + filter_at) as *u32
+            sums = (view + sums_at) as *u64
+            if head[6] != 0: marks = view + marks_at
+        elif head[0] != DbSegMagic
+            return DbSegDamaged
+        if head[1] != size as u64: return DbSegOtherSize
+        if head[0] == DbSegMagic2 and head[3] != same as u64: return DbSegOtherSame
+        if count < 0 or DbSegHeader + count * size > file.size: return DbSegDamaged
+        return DbSegOk
+
+    fn close()
+        sn_db_unmap(view, mapping)
+        view = null
+        mapping = null
+        filter = null
+        sums = null
+        marks = null
+        file.close()
+
+    @inline
+    fn may_hold(key: u64) -> bool
+        if blocks == 0: return true
+        let h = db_filter_hash(key)
+        let block = filter + mul_high(h, blocks) * 8
+        let low = h as u32
+        for i in 0..8
+            if block[i] >> ((low * DbFilterSalts[i]) >> 27) & 1 == 0: return false
+        return true
+
+    fn verify() -> bool
+        if blocks == 0 and sum_count == 0: return true
+        let bytes = count * size
+        let record_sums = (bytes + DbSumBlock - 1) / DbSumBlock
+        if sum_count != record_sums + (marks ? 1 : 0): return false
+        for i in 0..record_sums
+            let at = i * DbSumBlock
+            if db_hash(view + DbSegHeader + at, min(DbSumBlock, bytes - at)) != sums[i]: return false
+        return not marks or db_hash(marks, count) == sums[record_sums]
+
+    @inline
+    fn mark(i: i64) -> u8
+        return marks ? marks[i] : 0
+
+    fn run(from: i64, to: i64) -> DbRun
+        return DbRun(records: record(from), count: to - from, size: size, marks: marks ? marks + from : null)
+
+    fn first_of(key: u64) -> i64
+        var lo: i64 = 0
+        var hi = count
+        var low_key: u64 = 0
+        var high_key: u64 = 0xFFFFFFFFFFFFFFFF
+        var guesses = 0
+        while hi - lo > 16
+            var at = lo + (hi - lo) / 2
+            if guesses < 6
+                let part = (key - low_key) as f64 / ((high_key - low_key) as f64 + 1.0)
+                at = lo + (part * (hi - lo) as f64) as i64
+                at = clamp(at, lo, hi - 1)
+            guesses += 1
+            let k = key_at(at)
+            if k < key
+                lo = at + 1
+                low_key = k
+            else
+                hi = at
+                high_key = k
+        while lo < hi and key_at(lo) < key: lo += 1
+        return lo
+
+    fn find_marked(key: u64, out: *[..]u8, better: extern fn(*u8, *u8) -> bool)
+        if count == 0 or not may_hold(key): return
+        var i = first_of(key)
+        while i < count and key_at(i) == key
+            db_keep_marked(out, record(i), mark(i), size, same, better)
+            i += 1
+
+struct DbSegWriter
+    file: DbFile
+    size: int
+    same: int
+    count: i64
+    at: i64
+    buffer: [..]u8
+    filter: [..]u32
+    blocks: u64
+    sums: [..]u64
+    marks: [..]u8
+    marking: bool
+    ok: bool
+
+    fn begin(path: str, record_size: int, same_bytes: int, expect: i64) -> bool
+        size = record_size
+        same = same_bytes
+        count = 0
+        at = DbSegHeader
+        blocks = max((expect * DbFilterBits + 255) / 256, 1) as u64
+        filter.clear()
+        filter.resize(blocks as i64 * 8)
+        sums.clear()
+        marks.clear()
+        marking = false
+        buffer.clear()
+        ok = file.open(path, DbCreate)
+        return ok
+
+    fn add(rec: *u8, mark: u8)
+        if mark != 0 and not marking
+            marks.resize(count)
+            marking = true
+        if marking: marks.push(mark)
+        let b = buffer.len
+        buffer.resize(b + size)
+        copy(&buffer[b], rec, size)
+        count += 1
+        db_filter_add(filter.ptr, blocks, (rec as *u64)[0])
+        if buffer.len >= DbWriteChunk: spill(false)
+
+    fn spill(last: bool)
+        let whole = last ? buffer.len : buffer.len / DbSumBlock * DbSumBlock
+        var i = 0
+        while i < whole
+            let n = min(DbSumBlock, whole - i)
+            sums.push(db_hash(&buffer[i], n))
+            i += n
+        if ok: ok = file.write_at(at, buffer.ptr, whole)
+        at += whole
+        let rest = buffer.len - whole
+        if rest > 0: copy(buffer.ptr, &buffer[whole], rest)
+        buffer.resize(rest)
+
+    fn finish() -> bool
+        spill(true)
+        let filter_at = db_round64(at)
+        let sums_at = filter_at + blocks as i64 * 32
+        if marks.len > 0: sums.push(db_hash(marks.ptr, marks.len))
+        if ok: ok = file.write_at(filter_at, filter.ptr, blocks as i64 * 32)
+        if ok: ok = file.write_at(sums_at, sums.ptr, sums.len as i64 * 8)
+        if ok: ok = file.write_at(sums_at + sums.len as i64 * 8, marks.ptr, marks.len as i64)
+        var head: [8]u64
+        head[0] = DbSegMagic2
+        head[1] = size as u64
+        head[2] = count as u64
+        head[3] = same as u64
+        head[4] = blocks
+        head[5] = sums.len as u64
+        head[6] = marks.len > 0 ? 1 : 0
+        head[7] = db_hash(&head[0] as *u8, 56)
+        if ok: ok = file.write_at(0, &head[0], DbSegHeader)
+        if ok: ok = file.sync()
+        file.close()
+        free_buffers()
+        return ok
+
+    fn abandon()
+        file.close()
+        free_buffers()
+
+    fn free_buffers()
+        buffer.free()
+        filter.free()
+        sums.free()
+        marks.free()
+
+@inline
+fn db_filter_hash(key: u64) -> u64
+    var z = (key ^ key >> 33) * 0xFF51AFD7ED558CCD
+    z = (z ^ z >> 33) * 0xC4CEB9FE1A85EC53
+    return z ^ z >> 33
+
+fn db_filter_add(filter: *u32, blocks: u64, key: u64)
+    let h = db_filter_hash(key)
+    let block = filter + mul_high(h, blocks) * 8
+    let low = h as u32
+    for i in 0..8: block[i] |= (1 as u32) << ((low * DbFilterSalts[i]) >> 27)

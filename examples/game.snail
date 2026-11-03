@@ -1,0 +1,51 @@
+use snaildb/snaildb
+
+struct Entity
+    key: u64
+    x: f32
+    y: f32
+    hp: i32
+    kind: u32
+
+struct Score
+    key: u64
+    player: u32
+    points: i32
+
+fn higher(a: *u8, b: *u8) -> bool
+    return (a as *Score).points > (b as *Score).points
+
+fn main()
+    var db: Db
+    let settings = db.kv("settings", 256)
+    let world = db.newest_table("world", sizeof(Entity), 0)
+    let scores = db.table("scores", sizeof(Score), 4, higher)
+    let players = db.name_list("players")
+    if not db.open("build/game_data")
+        print("cannot open: {db.error}")
+        return
+
+    db.set(settings, "volume", "80" as []u8)
+    db.set(settings, "slot 1", "forest, level 3" as []u8)
+
+    for frame in 0..60
+        for id in 0..5
+            var e = Entity(key: db_key2(7, id), x: frame as f32, y: id as f32 * 2.0, hp: 100 - frame, kind: 1)
+            db.put(world, &e as *u8)
+    db.remove_key(world, db_key2(7, 4))
+
+    let ada = db.name_id(players, "Ada")
+    var s = Score(key: 3, player: ada, points: 1200)
+    db.put(scores, &s as *u8)
+    if not db.commit(): print("not saved: {db.error}")
+
+    var value: [..]u8
+    defer value.free()
+    if db.get(settings, "slot 1", &value): print("slot 1: {str(value[0..value.len])}")
+    db.range(world, db_key2(7, 0), db_key2(7, 0xFFFFFFFF), |r| show(r as *Entity))
+    if not db.backup("build/game_backup"): print("no backup: {db.error}")
+    db.close()
+    db.release()
+
+fn show(e: *Entity)
+    print("zone 7 entity {e.key & 0xFFFFFFFF} at {e.x:.0}, {e.y:.0}, hp {e.hp}")

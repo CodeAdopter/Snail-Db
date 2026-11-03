@@ -1,0 +1,239 @@
+use snaildb/db_os
+use snaildb/db_sort
+
+const DbChunks = 40
+const DbFirstShift = 6
+const DbRecordHead = 16
+
+struct DbSlots
+    heads: [..]i32
+
+struct DbMem
+    size: int
+    stride: int
+    chunks: [DbChunks]*u8
+    table: *DbSlots
+    old_tables: [..]*DbSlots
+    count: int
+    marked: int
+    bytes: i64
+
+    fn init(record_size: int)
+        size = record_size
+        stride = (DbRecordHead + size + 7) & ~7
+
+    @inline
+    fn head(i: int) -> *u8
+        let j = (i + (1 << DbFirstShift)) as u64
+        let top = sn_db_top_bit(j)
+        return chunks[top - DbFirstShift] + (j ^ (1 as u64) << top) as i64 * stride
+
+    @inline
+    fn record(i: int) -> *u8
+        return head(i) + DbRecordHead
+
+    @inline
+    fn link_of(i: int) -> *i32
+        return head(i) as *i32
+
+    @inline
+    fn version_of(i: int) -> *u32
+        return (head(i) + 4) as *u32
+
+    @inline
+    fn mark_at(i: int) -> *u8
+        return head(i) + 8
+
+    @inline
+    fn key_of(i: int) -> u64
+        return (record(i) as *u64)[0]
+
+    @inline
+    fn mark_of(i: int) -> u8
+        return mark_at(i)[0]
+
+    fn slot_of(tab: *DbSlots, key: u64) -> int
+        let mask = tab.heads.len - 1
+        var s = db_slot(key, mask)
+        loop
+            let h = sn_db_load_i32(&tab.heads[s])
+            if h == 0 or key_of(h - 1) == key: return s
+            s = (s + 1) & mask
+
+    fn head_of(tab: *DbSlots, key: u64) -> int
+        let mask = tab.heads.len - 1
+        var s = db_slot(key, mask)
+        loop
+            let h = sn_db_load_i32(&tab.heads[s])
+            if h == 0 or key_of(h - 1) == key: return h
+            s = (s + 1) & mask
+
+    fn grow()
+        var tab = new DbSlots
+        let room = table ? table.heads.len * 2 : 1024
+        tab.heads.resize(room)
+        bytes += room as i64 * 4
+        let mask = room - 1
+        var i = count - 1
+        while i >= 0
+            let k = key_of(i)
+            var s = db_slot(k, mask)
+            loop
+                let h = tab.heads[s]
+                if h == 0
+                    tab.heads[s] = i + 1
+                    break
+                if key_of(h - 1) == k: break
+                s = (s + 1) & mask
+            i -= 1
+        if table: old_tables.push(table)
+        sn_db_store_ptr(&table as **void, tab)
+
+    fn put(rec: *u8, mark: u8, same: int, better: extern fn(*u8, *u8) -> bool) -> bool
+        if not table or (count + 1) * 2 > table.heads.len: grow()
+        let tab = table
+        let key = (rec as *u64)[0]
+        let s = slot_of(tab, key)
+        let head = tab.heads[s] - 1
+        var i = head
+        while i >= 0
+            let r = record(i)
+            if db_same(r, rec, same)
+                let old = mark_of(i)
+                if mark & DbDead != 0
+                    replace(i, rec, DbDead | DbShadow)
+                    return old & DbDead == 0
+                if old & DbDead != 0 or mark & DbShadow != 0
+                    replace(i, rec, DbShadow)
+                    return true
+                if not better(rec, r): return false
+                replace(i, rec, old)
+                return true
+            i = link_of(i)[0]
+        let at = count
+        let top = sn_db_top_bit((at + (1 << DbFirstShift)) as u64)
+        let c = top - DbFirstShift
+        if c >= DbChunks: db_full()
+        if not chunks[c]: chunks[c] = alloc[u8](((1 as i64) << top) * stride)
+        bytes += stride
+        copy(record(at), rec, size)
+        link_of(at)[0] = head
+        mark_at(at)[0] = mark
+        if mark != 0: marked += 1
+        sn_db_store_i32(&tab.heads[s], at + 1)
+        count += 1
+        return true
+
+    fn replace(i: int, rec: *u8, mark: u8)
+        let old = mark_of(i)
+        if old == 0 and mark != 0: marked += 1
+        if old != 0 and mark == 0: marked -= 1
+        sn_db_write_record(record(i), rec, size, version_of(i), mark_at(i), mark)
+
+    fn find(key: u64, out: *[..]u8, same: int, better: extern fn(*u8, *u8) -> bool, scratch: *u8)
+        let tab = sn_db_load_ptr(&table as **void) as *DbSlots
+        if not tab: return
+        var i = head_of(tab, key) - 1
+        while i >= 0
+            let m = sn_db_read_record(scratch, record(i), size, version_of(i), mark_at(i))
+            db_keep_marked(out, scratch, m, size, same, better)
+            i = link_of(i)[0]
+
+    fn copy_range(from: u64, to: u64, out: *[..]u8, out_marks: *[..]u8)
+        out.clear()
+        out_marks.clear()
+        for i in 0..count
+            let k = key_of(i)
+            if k < from or k > to: continue
+            let at = out.len
+            out.resize(at + size)
+            copy(&out[at], record(i), size)
+            if marked > 0: out_marks.push(mark_of(i))
+
+    fn order_runs(keys: *[..]u64, order: *[..]u32, same: int)
+        let n = keys.len
+        var i = 0
+        while i < n
+            var end = i + 1
+            while end < n and keys[end] == keys[i]: end += 1
+            for j in i + 1..end
+                let moving = order[j]
+                var k = j
+                while k > i and db_memcmp(record(order[k - 1] as int) + 8, record(moving as int) + 8, same as u64) > 0
+                    order[k] = order[k - 1]
+                    k -= 1
+                order[k] = moving
+            i = end
+
+    fn release()
+        for c in 0..DbChunks
+            if chunks[c]
+                free(chunks[c])
+                chunks[c] = null
+        if table
+            table.heads.free()
+            free(table)
+            table = null
+        for t in old_tables
+            t.heads.free()
+            free(t)
+        old_tables.free()
+        count = 0
+        marked = 0
+        bytes = 0
+
+@cold
+fn db_full()
+    panic("snaildb: a table's memory is full")
+
+fn db_mem(size: int) -> *DbMem
+    var m = new DbMem
+    m.init(size)
+    return m
+
+@inline
+fn db_slot(key: u64, mask: int) -> int
+    return ((key * 0x9E3779B97F4A7C15) >> 32) as int & mask
+
+fn db_sort_run(records: *[..]u8, marks: *[..]u8, size: int, same: int) -> DbRun
+    let n = records.len / size
+    if n > 1
+        var keys: [..]u64
+        var order: [..]u32
+        var sorted: [..]u8
+        var sorted_marks: [..]u8
+        defer keys.free()
+        defer order.free()
+        defer sorted.free()
+        defer sorted_marks.free()
+        keys.resize(n)
+        order.resize(n)
+        for i in 0..n
+            keys[i] = (&records[i * size] as *u64)[0]
+            order[i] = i as u32
+        db_sort_pairs(&keys, &order)
+        if same > 0: db_order_runs(&keys, &order, records.ptr, size, same)
+        sorted.resize(records.len)
+        if marks.len > 0: sorted_marks.resize(n)
+        for j in 0..n
+            let i = order[j] as int
+            copy(&sorted[j * size], &records[i * size], size)
+            if marks.len > 0: sorted_marks[j] = marks[i]
+        copy(records.ptr, sorted.ptr, records.len)
+        if marks.len > 0: copy(marks.ptr, sorted_marks.ptr, n)
+    return DbRun(records: records.ptr, count: n, size: size, marks: marks.len > 0 ? marks.ptr : null)
+
+fn db_order_runs(keys: *[..]u64, order: *[..]u32, data: *u8, size: int, same: int)
+    let n = keys.len
+    var i = 0
+    while i < n
+        var end = i + 1
+        while end < n and keys[end] == keys[i]: end += 1
+        for j in i + 1..end
+            let moving = order[j]
+            var k = j
+            while k > i and db_memcmp(data + order[k - 1] as i64 * size + 8, data + moving as i64 * size + 8, same as u64) > 0
+                order[k] = order[k - 1]
+                k -= 1
+            order[k] = moving
+        i = end
