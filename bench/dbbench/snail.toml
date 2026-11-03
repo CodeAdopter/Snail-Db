@@ -1,0 +1,7 @@
+main = "dbbench.snail"
+output = "../../build/dbbench.exe"
+libs = ["../../snaildb"]
+include = ["../vendor/leveldb/include"]
+libpath = ["../vendor/leveldb"]
+link = ["leveldb"]
+copy = ["../vendor/leveldb/leveldb.dll"]

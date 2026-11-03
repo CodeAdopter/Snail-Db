@@ -1,6 +1,8 @@
 use snaildb/db_memtable
 use snaildb/db_segment
 
+const DbAhead = 8
+
 struct DbTable
     name: str
     tag: u8
@@ -120,21 +122,26 @@ struct DbTable
             if to == 0xFFFFFFFFFFFFFFFF: end = s.count
             else: end = s.first_of(to + 1)
             if end > start: runs.push(s.run(start, end))
-        frozen.copy_range(from, to, &held.frozen, &held.frozen_marks)
-        live.copy_range(from, to, &held.live, &held.live_marks)
+        frozen.copy_range(from, to, &held.frozen)
+        live.copy_range(from, to, &held.live)
 
     fn add_copies(runs: *[..]DbRun, held: *DbCopy)
-        let f = db_sort_run(&held.frozen, &held.frozen_marks, size, same)
+        let f = held.frozen.sort(size, same)
         if f.count > 0: runs.push(f)
-        let l = db_sort_run(&held.live, &held.live_marks, size, same)
+        let l = held.live.sort(size, same)
         if l.count > 0: runs.push(l)
 
-    fn merge(runs: []DbRun, emit: fn(*u8, u8), stop: *int, oldest: bool) -> bool
+    # Hands on the winning records of sorted runs in key order, or in reverse with back. Runs are
+    # oldest first; records that match are picked newest first in either direction.
+    fn merge(runs: []DbRun, emit: fn(*u8, u8), stop: *int, oldest: bool, back: bool) -> bool
         let k = runs.len
         if k <= 0: return true
         var at: [..]i64
         defer at.free()
         at.resize(k)
+        if back
+            for j in 0..k: at[j] = runs[j].count - 1
+        let step: i64 = back ? -1 : 1
         var pending: [..]u8
         defer pending.free()
         pending.resize(size)
@@ -148,15 +155,21 @@ struct DbTable
             var pick_rec: *u8 = null
             var j = k - 1
             while j >= 0
-                if at[j] < runs[j].count
+                if at[j] >= 0 and at[j] < runs[j].count
                     let r = runs[j].record(at[j])
-                    if pick < 0 or db_before(r, pick_rec, same)
+                    if pick < 0 or (back ? db_before(pick_rec, r, same) : db_before(r, pick_rec, same))
                         pick = j
                         pick_rec = r
                 j -= 1
             if pick < 0: break
             let m = runs[pick].mark(at[pick])
-            at[pick] += 1
+            at[pick] += step
+            # Records of a sorted copy are read out of place, so fetch the ones coming up early.
+            let ahead = at[pick] + step * DbAhead
+            if runs[pick].order and ahead >= 0 and ahead < runs[pick].count
+                let r = runs[pick].record(ahead)
+                sn_db_prefetch(r)
+                sn_db_prefetch(r + size - 1)
             if have and db_same(pending.ptr, pick_rec, same)
                 if mark & DbClosed != 0: continue
                 if m & DbDead != 0
@@ -200,16 +213,12 @@ struct DbView
     list: [..]*DbSegment
 
 struct DbCopy
-    frozen: [..]u8
-    frozen_marks: [..]u8
-    live: [..]u8
-    live_marks: [..]u8
+    frozen: DbHeld
+    live: DbHeld
 
     fn free()
         frozen.free()
-        frozen_marks.free()
         live.free()
-        live_marks.free()
 
 fn db_newest(a: *u8, b: *u8) -> bool
     return true

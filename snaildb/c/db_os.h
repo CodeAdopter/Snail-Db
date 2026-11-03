@@ -11,6 +11,7 @@ __declspec(dllimport) int __stdcall SetEndOfFile(void *file);
 __declspec(dllimport) void *__stdcall CreateFileMappingW(void *file, void *security, unsigned long protect, unsigned long high, unsigned long low, const unsigned short *name);
 __declspec(dllimport) void *__stdcall MapViewOfFile(void *mapping, unsigned long access, unsigned long high, unsigned long low, unsigned long long size);
 __declspec(dllimport) int __stdcall UnmapViewOfFile(const void *base);
+__declspec(dllimport) int __stdcall FlushViewOfFile(const void *base, unsigned long long size);
 __declspec(dllimport) int __stdcall MoveFileExW(const unsigned short *from, const unsigned short *to, unsigned long flags);
 __declspec(dllimport) int __stdcall DeleteFileW(const unsigned short *path);
 __declspec(dllimport) int __stdcall CreateDirectoryW(const unsigned short *path, void *security);
@@ -120,6 +121,22 @@ static void *sn_db_map(void *file, long long size, void **mapping)
     *mapping = m;
     return view;
 }
+
+static void *sn_db_map_write(void *file, long long size, void **mapping)
+{
+    *mapping = 0;
+    if (size <= 0) return 0;
+    void *m = CreateFileMappingW(file, 0, 0x04, (unsigned long)(size >> 32), (unsigned long)size, 0);
+    if (!m) return 0;
+    void *view = MapViewOfFile(m, 0x0002, 0, 0, (unsigned long long)size);
+    if (!view) { CloseHandle(m); return 0; }
+    *mapping = m;
+    return view;
+}
+
+static int sn_db_flush_view(void *view, long long size) { return FlushViewOfFile(view, (unsigned long long)size); }
+
+static inline void sn_db_prefetch(const void *p) { __builtin_prefetch(p); }
 
 static void sn_db_unmap(void *view, void *mapping)
 {

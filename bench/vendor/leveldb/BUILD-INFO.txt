@@ -7,7 +7,7 @@ compiler: Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36257 for x64 (t
 build: cmake version 4.3.1-msvc1, Ninja, target leveldb
 cmake: -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLEVELDB_BUILD_TESTS=OFF -DLEVELDB_BUILD_BENCHMARKS=OFF -DLEVELDB_INSTALL=OFF -DHAVE_SNAPPY=0 -DHAVE_CRC32C=0 -DHAVE_TCMALLOC=0
 kind: DLL exporting the C API, C runtime linked in (/MT)
-exports: 68 leveldb_* C functions of 242 names, including the 44 bench/bind_leveldb.snail declares
+exports: 68 leveldb_* C functions of 242 names, including the 47 bench/bind_leveldb.snail declares
 imports: KERNEL32.dll
 files:
   LICENSE 1484 bytes

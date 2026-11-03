@@ -139,16 +139,25 @@ struct DbMem
             db_keep_marked(out, scratch, m, size, same, better)
             i = link_of(i)[0]
 
-    fn copy_range(from: u64, to: u64, out: *[..]u8, out_marks: *[..]u8)
-        out.clear()
-        out_marks.clear()
+    fn copy_range(from: u64, to: u64, out: *DbHeld)
+        var n = count
+        if from != 0 or to != 0xFFFFFFFFFFFFFFFF
+            n = 0
+            for i in 0..count
+                let k = key_of(i)
+                if k >= from and k <= to: n += 1
+        out.records.resize(n as i64 * size)
+        out.marks.resize(marked > 0 ? n : 0)
+        out.keys.resize(n)
+        var at = 0
         for i in 0..count
+            if at == n: break
             let k = key_of(i)
             if k < from or k > to: continue
-            let at = out.len
-            out.resize(at + size)
-            copy(&out[at], record(i), size)
-            if marked > 0: out_marks.push(mark_of(i))
+            copy(&out.records[at as i64 * size], record(i), size)
+            if marked > 0: out.marks[at] = mark_of(i)
+            out.keys[at] = k
+            at += 1
 
     fn order_runs(keys: *[..]u64, order: *[..]u32, same: int)
         let n = keys.len
@@ -195,33 +204,29 @@ fn db_mem(size: int) -> *DbMem
 fn db_slot(key: u64, mask: int) -> int
     return ((key * 0x9E3779B97F4A7C15) >> 32) as int & mask
 
-fn db_sort_run(records: *[..]u8, marks: *[..]u8, size: int, same: int) -> DbRun
-    let n = records.len / size
-    if n > 1
-        var keys: [..]u64
-        var order: [..]u32
-        var sorted: [..]u8
-        var sorted_marks: [..]u8
-        defer keys.free()
-        defer order.free()
-        defer sorted.free()
-        defer sorted_marks.free()
-        keys.resize(n)
-        order.resize(n)
-        for i in 0..n
-            keys[i] = (&records[i * size] as *u64)[0]
-            order[i] = i as u32
-        db_sort_pairs(&keys, &order)
-        if same > 0: db_order_runs(&keys, &order, records.ptr, size, same)
-        sorted.resize(records.len)
-        if marks.len > 0: sorted_marks.resize(n)
-        for j in 0..n
-            let i = order[j] as int
-            copy(&sorted[j * size], &records[i * size], size)
-            if marks.len > 0: sorted_marks[j] = marks[i]
-        copy(records.ptr, sorted.ptr, records.len)
-        if marks.len > 0: copy(marks.ptr, sorted_marks.ptr, n)
-    return DbRun(records: records.ptr, count: n, size: size, marks: marks.len > 0 ? marks.ptr : null)
+# Records copied from memory, with their marks and keys, and their positions in key order once sorted.
+struct DbHeld
+    records: [..]u8
+    marks: [..]u8
+    keys: [..]u64
+    order: [..]u32
+
+    # Sorts the records by listing their positions in order, leaving the records where they are.
+    fn sort(size: int, same: int) -> DbRun
+        let n = keys.len
+        order.clear()
+        if n > 1
+            order.resize(n)
+            for i in 0..n: order[i] = i as u32
+            db_sort_pairs(&keys, &order)
+            if same > 0: db_order_runs(&keys, &order, records.ptr, size, same)
+        return DbRun(records: records.ptr, count: n, size: size, marks: marks.len > 0 ? marks.ptr : null, order: order.len > 0 ? order.ptr : null)
+
+    fn free()
+        records.free()
+        marks.free()
+        keys.free()
+        order.free()
 
 fn db_order_runs(keys: *[..]u64, order: *[..]u32, data: *u8, size: int, same: int)
     let n = keys.len

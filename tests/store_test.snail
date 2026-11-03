@@ -615,6 +615,16 @@ struct Model
         if at != got.len: bad += 1
         if trace and at != got.len and range_bad < 4: print("step {step} range {from:016X}..{to:016X}: want {at} got {got.len}")
         if at != got.len: range_bad += 1
+        var back: [..]Row
+        defer back.free()
+        db.range_back(rows, from, to, |r| back.push((r as *Row)[0]))
+        var mirrored = back.len == got.len
+        for i in 0..min(back.len, got.len)
+            let a = back[back.len - 1 - i]
+            let b = got[i]
+            if a.key != b.key or a.kind != b.kind or a.depth != b.depth or a.value != b.value: mirrored = false
+        if not mirrored: bad += 1
+        if trace and not mirrored: print("step {step} range {from:016X}..{to:016X}: backward walk differs")
 
 fn model(folder: str, newest: bool)
     var db: Db

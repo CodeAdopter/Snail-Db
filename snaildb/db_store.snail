@@ -17,7 +17,7 @@ struct Db
     tables: [..]*DbTable
     lists: [..]*DbNames
     journals: [..]*DbJournal
-    wal: DbFile
+    wal: DbLog
     wal_batch: [..]u8
     next_number: int = 1
     live_most: i64 = DbLiveMost
@@ -357,9 +357,18 @@ struct Db
         return n
 
     fn each(t: *DbTable, visit: fn(*u8))
-        range(t, 0, 0xFFFFFFFFFFFFFFFF, visit)
+        walk(t, 0, 0xFFFFFFFFFFFFFFFF, visit, false)
+
+    fn each_back(t: *DbTable, visit: fn(*u8))
+        walk(t, 0, 0xFFFFFFFFFFFFFFFF, visit, true)
 
     fn range(t: *DbTable, from: u64, to: u64, visit: fn(*u8))
+        walk(t, from, to, visit, false)
+
+    fn range_back(t: *DbTable, from: u64, to: u64, visit: fn(*u8))
+        walk(t, from, to, visit, true)
+
+    fn walk(t: *DbTable, from: u64, to: u64, visit: fn(*u8), back: bool)
         if not open_ok: db_misuse("open the store before using it")
         if from > to: return
         var list: [..]*DbSegment
@@ -375,7 +384,7 @@ struct Db
         guard.read_done()
         t.add_copies(&runs, &held)
         var never = 0
-        t.merge(runs[0..runs.len], |r, m| visit(r), &never, true)
+        t.merge(runs[0..runs.len], |r, m| visit(r), &never, true, back)
         unpin()
 
     fn verify() -> bool
@@ -896,7 +905,7 @@ struct Db
         let seg_path = segment_path(table, number, &name)
         var w: DbSegWriter
         w.begin(seg_path, table.size, table.same, expect)
-        if not table.merge(runs[0..runs.len], |r, m| w.add(r, m), &closing, oldest)
+        if not table.merge(runs[0..runs.len], |r, m| w.add(r, m), &closing, oldest, false)
             w.abandon()
             db_delete(seg_path)
             return

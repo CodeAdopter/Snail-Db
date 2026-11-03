@@ -8,6 +8,9 @@ extern fn sn_db_sync(file: *void) -> int
 extern fn sn_db_truncate(file: *void, size: i64) -> int
 extern fn sn_db_close(file: *void)
 extern fn sn_db_map(file: *void, size: i64, mapping: **void) -> *void
+extern fn sn_db_map_write(file: *void, size: i64, mapping: **void) -> *void
+extern fn sn_db_flush_view(view: *void, size: i64) -> int
+extern fn sn_db_prefetch(p: *void)
 extern fn sn_db_unmap(view: *void, mapping: *void)
 extern fn sn_db_rename(from: *u8, from_len: int, to: *u8, to_len: int) -> int
 extern fn sn_db_delete(path: *u8, len: int) -> int
@@ -127,6 +130,81 @@ struct DbFile
     fn close()
         sn_db_close(handle)
         handle = null
+
+const DbLogFirst: i64 = 1048576
+const DbLogStep: i64 = 67108864
+
+# An append-only file written through a mapped view, so an append is a copy into the OS's cache
+# instead of a call into it. What is copied survives the process ending; sync puts it on disk.
+# The file grows ahead of the writes, its tail zeros, and is cut back to what was written on close.
+struct DbLog
+    file: DbFile
+    view: *u8
+    mapping: *void
+    room: i64
+    size: i64
+    synced: i64
+    error: int
+
+    fn open(path: str, mode: int) -> bool
+        if not file.open(path, mode)
+            error = file.error
+            return false
+        size = file.size
+        synced = size
+        return true
+
+    fn append(data: *void, count: i64) -> bool
+        if count <= 0: return true
+        if not db_write_allowed()
+            error = DbErrorDiskFull
+            return false
+        if size + count > room and not grow(size + count): return false
+        copy(view + size, data as *u8, count)
+        size += count
+        return true
+
+    fn grow(need: i64) -> bool
+        var want = max(room, DbLogFirst)
+        while want < need: want += min(want, DbLogStep)
+        unmap()
+        view = sn_db_map_write(file.handle, want, &mapping) as *u8
+        if not view
+            error = sn_db_last_error()
+            return false
+        room = want
+        return true
+
+    fn sync() -> bool
+        if size > synced and sn_db_flush_view(view + synced, size - synced) == 0
+            error = sn_db_last_error()
+            return false
+        if not file.sync()
+            error = file.error
+            return false
+        synced = size
+        return true
+
+    fn cut(at: i64) -> bool
+        unmap()
+        if not file.cut(at)
+            error = file.error
+            return false
+        size = at
+        synced = at
+        return true
+
+    fn unmap()
+        sn_db_unmap(view, mapping)
+        view = null
+        mapping = null
+        room = 0
+
+    fn close()
+        if not file.handle: return
+        unmap()
+        file.cut(size)
+        file.close()
 
 struct DbPart
     entries: [..]u8

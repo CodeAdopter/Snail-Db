@@ -57,9 +57,12 @@ extern fn leveldb_writeoptions_set_sync(options: *leveldb_writeoptions_t, v: u8)
 
 extern fn leveldb_create_iterator(db: *leveldb_t, options: *leveldb_readoptions_t) -> *leveldb_iterator_t
 extern fn leveldb_iter_seek(it: *leveldb_iterator_t, k: *u8, klen: u64)
+extern fn leveldb_iter_seek_to_first(it: *leveldb_iterator_t)
+extern fn leveldb_iter_seek_to_last(it: *leveldb_iterator_t)
 extern fn leveldb_iter_valid(it: *leveldb_iterator_t) -> u8
 extern fn leveldb_iter_key(it: *leveldb_iterator_t, klen: *u64) -> *u8
 extern fn leveldb_iter_value(it: *leveldb_iterator_t, vlen: *u64) -> *u8
 extern fn leveldb_iter_next(it: *leveldb_iterator_t)
+extern fn leveldb_iter_prev(it: *leveldb_iterator_t)
 extern fn leveldb_iter_get_error(it: *leveldb_iterator_t, errptr: *cstr)
 extern fn leveldb_iter_destroy(it: *leveldb_iterator_t)

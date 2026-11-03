@@ -91,16 +91,22 @@ fn db_unmark(out: *[..]u8, size: int)
         kept += 1
     out.resize(kept * size)
 
+# Sorted records, in place or, with order, through a list of their positions.
 struct DbRun
     records: *u8
     count: i64
     size: int
     marks: *u8
+    order: *u32
+
+    @inline
+    fn at(i: i64) -> i64
+        return order ? order[i] as i64 : i
 
     @inline
     fn record(i: i64) -> *u8
-        return records + i * size
+        return records + at(i) * size
 
     @inline
     fn mark(i: i64) -> u8
-        return marks ? marks[i] : 0
+        return marks ? marks[at(i)] : 0

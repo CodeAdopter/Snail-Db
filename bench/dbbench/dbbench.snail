@@ -1,0 +1,439 @@
+use snaildb/snaildb
+use ../bind_leveldb
+
+# LevelDB's db_bench, run against Snail Db and LevelDB: its default benchmarks in its order, on
+# entries of a 16-byte key and a 100-byte value. Snail Db stores each as a 116-byte record under a
+# u64 key, so both move the same bytes an op. Every write is one op, as db_bench writes a batch of
+# one: a Snail Db put is followed by a commit, which hands it to the OS as a LevelDB put does.
+# LevelDB runs twice: with db_bench's settings, which are its defaults, and tuned as in bench.snail.
+
+const KeyBytes = 16
+const ValueBytes = 100
+const EntryBytes = KeyBytes + ValueBytes
+const RandomBytes = 1048576
+const CacheBytes: u64 = 268435456
+const PauseMs = 10000
+const Stores = 3
+
+const FillSeq = 0
+const FillSync = 1
+const FillRandom = 2
+const Overwrite = 3
+const ReadRandom = 4
+const ReadSeq = 5
+const ReadReverse = 6
+const Compact = 7
+const ReadRandomAfter = 8
+const ReadSeqAfter = 9
+const ReadReverseAfter = 10
+const Steps = 11
+
+enum Kind: u8
+    SnailDb
+    LevelDb
+    LevelDbTuned
+
+fn kind_name(k: Kind) -> str
+    match k
+        SnailDb: return "Snail Db"
+        LevelDb: return "LevelDB, db_bench settings"
+        LevelDbTuned: return "LevelDB, tuned"
+
+fn kind_folder(k: Kind) -> str
+    match k
+        SnailDb: return "snaildb"
+        LevelDb: return "leveldb"
+        LevelDbTuned: return "leveldb-tuned"
+
+fn step_name(step: int) -> str
+    if step == FillSeq: return "fillseq"
+    if step == FillSync: return "fillsync"
+    if step == FillRandom: return "fillrandom"
+    if step == Overwrite: return "overwrite"
+    if step == ReadRandom or step == ReadRandomAfter: return "readrandom"
+    if step == ReadSeq or step == ReadSeqAfter: return "readseq"
+    if step == ReadReverse or step == ReadReverseAfter: return "readreverse"
+    return "compact"
+
+fn mix(x: u64) -> u64
+    var z = x + 0x9E3779B97F4A7C15
+    z = (z ^ z >> 30) * 0xBF58476D1CE4E5B9
+    z = (z ^ z >> 27) * 0x94D049BB133111EB
+    return z ^ z >> 31
+
+# The i-th random key of a step, below num as db_bench's Uniform(num) draws them.
+fn random_key(step: int, i: i64, num: i64) -> u64
+    return mix((step as u64) << 40 | i as u64) % num as u64
+
+# A key as db_bench writes it: 16 decimal digits.
+fn key_text(key: u64, out: *u8)
+    var v = key as int
+    var i = KeyBytes - 1
+    while i >= 0
+        out[i] = ('0' + v % 10) as u8
+        v = v / 10
+        i -= 1
+
+struct Measure
+    ran: bool
+    ops: i64
+    ns: i64
+    bytes: i64
+    found: i64
+
+    fn micros() -> f64
+        return ns as f64 / 1000.0 / ops as f64
+
+    fn mb_per_s() -> f64
+        return bytes as f64 / 1048576.0 / (ns as f64 / 1000000000.0)
+
+    fn per_s() -> f64
+        return ops as f64 / (ns as f64 / 1000000000.0)
+
+struct Result
+    ran: bool
+    steps: [Steps]Measure
+
+struct Store
+    kind: Kind
+    folder: [..]u8
+    db: Db
+    entries: *DbTable
+    level: *leveldb_t
+    level_options: *leveldb_options_t
+    level_cache: *leveldb_cache_t
+    level_filter: *leveldb_filterpolicy_t
+    level_write: *leveldb_writeoptions_t
+    level_read: *leveldb_readoptions_t
+    values: [..]u8
+    value_at: int
+    out: [..]u8
+    sum: i64
+    failed: bool
+    opened: int
+
+    fn path() -> str
+        return str(folder[0..folder.len - 1])
+
+    # Opens an empty store in a folder of its own, as db_bench destroys the last one, so files still
+    # held by the system after they are deleted can't get in the way. sync asks for every write to
+    # reach the disk.
+    fn open(at: str, sync: bool) -> bool
+        var name: [64]u8
+        opened += 1
+        db_path(&folder, at, format(&name, "{kind_folder(kind)}-{opened}"))
+        let p = path()
+        sn_db_make_folder(p.ptr, p.len as int)
+        empty_folder(p)
+        if kind == SnailDb
+            if not entries: entries = db.newest_table("entries", EntryBytes, 0)
+            db.sync_writes = sync
+            if not db.open(p)
+                print("Snail Db: {db.error}")
+                return false
+            return true
+        level_options = leveldb_options_create()
+        leveldb_options_set_create_if_missing(level_options, 1)
+        leveldb_options_set_compression(level_options, leveldb_no_compression)
+        if kind == LevelDbTuned
+            level_cache = leveldb_cache_create_lru(CacheBytes)
+            level_filter = leveldb_filterpolicy_create_bloom(10)
+            leveldb_options_set_cache(level_options, level_cache)
+            leveldb_options_set_filter_policy(level_options, level_filter)
+            leveldb_options_set_write_buffer_size(level_options, 67108864)
+            leveldb_options_set_max_file_size(level_options, 33554432)
+            leveldb_options_set_max_open_files(level_options, 10000)
+        var err: cstr = null
+        level = leveldb_open(level_options, p.ptr, &err)
+        if err
+            print("LevelDB: {err}")
+            leveldb_free_text(err)
+            return false
+        level_write = leveldb_writeoptions_create()
+        leveldb_writeoptions_set_sync(level_write, sync ? 1 : 0)
+        level_read = leveldb_readoptions_create()
+        return true
+
+    # Closes the store and deletes its files.
+    fn close()
+        if kind == SnailDb: db.close()
+        else
+            leveldb_close(level)
+            leveldb_writeoptions_destroy(level_write)
+            leveldb_readoptions_destroy(level_read)
+            leveldb_options_destroy(level_options)
+            if level_cache: leveldb_cache_destroy(level_cache)
+            if level_filter: leveldb_filterpolicy_destroy(level_filter)
+            level_cache = null
+            level_filter = null
+        empty_folder(path())
+
+    # The next n bytes of random data, as db_bench's RandomGenerator hands out values.
+    fn value(n: int) -> *u8
+        if value_at + n > values.len: value_at = 0
+        value_at += n
+        return values.ptr + (value_at - n) as i64
+
+    fn put(key: u64)
+        if kind == SnailDb
+            var rec: [EntryBytes]u8
+            (&rec[0] as *u64)[0] = key
+            copy(&rec[8], value(EntryBytes - 8), EntryBytes - 8)
+            db.put(entries, &rec[0])
+            if not db.commit(): failed = true
+            return
+        var k: [KeyBytes]u8
+        key_text(key, &k[0])
+        var err: cstr = null
+        leveldb_put(level, level_write, &k[0], KeyBytes, value(ValueBytes), ValueBytes, &err)
+        if err
+            leveldb_free_text(err)
+            failed = true
+
+    fn get(key: u64) -> bool
+        if kind == SnailDb
+            db.find(entries, key, &out)
+            if out.len == 0: return false
+            sum += out[8]
+            return true
+        var k: [KeyBytes]u8
+        key_text(key, &k[0])
+        var n: u64 = 0
+        var err: cstr = null
+        let v = leveldb_get(level, level_read, &k[0], KeyBytes, &n, &err)
+        if not v: return false
+        sum += v[0]
+        leveldb_free(v)
+        return true
+
+    # Reads every entry in key order, or in reverse, counting them and their bytes in m.
+    fn scan(forward: bool, m: *Measure)
+        if kind == SnailDb
+            var n = 0
+            var total: i64 = 0
+            if forward: db.each(entries, |r| n += seen(r, &total))
+            else: db.each_back(entries, |r| n += seen(r, &total))
+            sum += total
+            m.ops = n
+            m.bytes = n as i64 * EntryBytes
+            return
+        let it = leveldb_create_iterator(level, level_read)
+        if forward: leveldb_iter_seek_to_first(it)
+        else: leveldb_iter_seek_to_last(it)
+        var n: i64 = 0
+        var bytes: i64 = 0
+        while leveldb_iter_valid(it) != 0
+            var kn: u64 = 0
+            var vn: u64 = 0
+            leveldb_iter_key(it, &kn)
+            sum += leveldb_iter_value(it, &vn)[0]
+            bytes += (kn + vn) as i64
+            n += 1
+            if forward: leveldb_iter_next(it)
+            else: leveldb_iter_prev(it)
+        leveldb_iter_destroy(it)
+        m.ops = n
+        m.bytes = bytes
+
+    fn compact()
+        if kind == SnailDb: db.compact(entries)
+        else: leveldb_compact_range(level, null, 0, null, 0)
+
+fn seen(r: *u8, total: *i64) -> int
+    total[0] += r[8]
+    return 1
+
+fn empty_folder(folder: str)
+    var names: [..]u8
+    var p: [..]u8
+    defer names.free()
+    defer p.free()
+    if not db_list(folder, &names): return
+    var start = 0
+    for i in 0..names.len
+        if names[i] != '\n': continue
+        db_delete(db_path(&p, folder, str(names[start..i])))
+        start = i + 1
+
+fn writes(s: *Store, step: int, ops: i64, num: i64, m: *Measure)
+    let t = now_ns()
+    for i in 0..ops
+        if step == FillSeq: s.put(i as u64)
+        else: s.put(random_key(step, i, num))
+    m.ns = now_ns() - t
+    m.ops = ops
+    m.bytes = ops * EntryBytes
+    m.ran = true
+    report(step, m)
+
+fn reads(s: *Store, step: int, num: i64, m: *Measure)
+    let t = now_ns()
+    for i in 0..num
+        if s.get(random_key(step, i, num)): m.found += 1
+    m.ns = now_ns() - t
+    m.ops = num
+    m.ran = true
+    report(step, m)
+
+fn scans(s: *Store, step: int, forward: bool, m: *Measure)
+    let t = now_ns()
+    s.scan(forward, m)
+    m.ns = now_ns() - t
+    m.ran = true
+    report(step, m)
+
+# A line as db_bench prints it.
+fn report(step: int, m: *Measure)
+    var line: [..]u8
+    defer line.free()
+    db_add(&line, step_name(step))
+    while line.len < 12: line.push(' ')
+    write("{str(line[0..line.len])}: ")
+    if step == Compact
+        print("{m.ns as f64 / 1000000.0:.1} ms")
+        return
+    write("{m.micros():.3} micros/op;")
+    if m.bytes > 0: write(" {m.mb_per_s():.1} MB/s")
+    if m.found > 0 or step == ReadRandom or step == ReadRandomAfter: write(" ({m.found} of {m.ops} found)")
+    if step == FillSync: write(" ({m.ops} ops)")
+    print("")
+
+# A number as the tables show it, with commas between thousands.
+fn number(out: *[..]u8, v: f64, digits: int) -> str
+    var buffer: [64]u8
+    var text = format(&buffer, "{v:.0}")
+    if digits == 1: text = format(&buffer, "{v:.1}")
+    if digits == 2: text = format(&buffer, "{v:.2}")
+    if digits == 3: text = format(&buffer, "{v:.3}")
+    var whole = 0
+    while whole < text.len and text[whole] != '.': whole += 1
+    out.clear()
+    for i in 0..text.len
+        if i > 0 and i < whole and (whole - i) % 3 == 0 and text[i - 1] != '-': out.push(',')
+        out.push(text[i])
+    return str(out[0..out.len])
+
+# A lead as the tables show it: whole above 100, with one decimal above 1, else with two.
+fn times(out: *[..]u8, r: f64) -> str
+    number(out, r, r >= 100.0 ? 0 : (r >= 1.0 ? 1 : 2))
+    out.push('x')
+    return str(out[0..out.len])
+
+# A measurement as the tables show it: time an op with bytes a second, or with reads a second when
+# db_bench counts no bytes, as for readrandom.
+fn cell(m: *Measure, step: int)
+    var text: [..]u8
+    defer text.free()
+    if step == Compact
+        write(" {number(&text, m.ns as f64 / 1000000.0, 1)} ms |")
+        return
+    write(" {number(&text, m.micros(), 3)} µs/op, ")
+    if m.bytes > 0: write("{number(&text, m.mb_per_s(), 1)} MB/s |")
+    else: write("{number(&text, m.per_s() / 1000000.0, 2)} M reads/s |")
+
+fn header(results: []Result)
+    write("| |")
+    for i in 0..Stores
+        if results[i].ran: write(" {kind_name(i as Kind)} |")
+    print(" Snail Db ahead by |")
+    write("|---|")
+    for i in 0..Stores
+        if results[i].ran: write("---|")
+    print("---|")
+
+# A row of every store's result, then how many times faster Snail Db is than the best LevelDB.
+fn row(title: str, results: []Result, step: int)
+    var text: [..]u8
+    defer text.free()
+    write("| {title} |")
+    var best: f64 = 0.0
+    for i in 0..Stores
+        if not results[i].ran: continue
+        let m = &results[i].steps[step]
+        cell(m, step)
+        if i > 0 and (best == 0.0 or m.ns as f64 / m.ops as f64 < best): best = m.ns as f64 / m.ops as f64
+    if not results[0].ran or best == 0.0
+        print(" |")
+        return
+    let ours = &results[0].steps[step]
+    let lead = best / (ours.ns as f64 / ours.ops as f64)
+    if lead >= 1.0: print(" **{times(&text, lead)}** |")
+    else: print(" {times(&text, lead)} |")
+
+fn run(kind: Kind, at: str, num: i64, r: *Result)
+    var s = Store(kind: kind)
+    s.values.resize(RandomBytes)
+    for i in 0..RandomBytes: s.values[i] = (mix(i as u64) >> 56) as u8
+    print("")
+    print("{kind_name(kind)}")
+    if not s.open(at, false): return
+    writes(&s, FillSeq, num, num, &r.steps[FillSeq])
+    s.close()
+    if not s.open(at, true): return
+    writes(&s, FillSync, num / 1000, num, &r.steps[FillSync])
+    s.close()
+    if not s.open(at, false): return
+    writes(&s, FillRandom, num, num, &r.steps[FillRandom])
+    writes(&s, Overwrite, num, num, &r.steps[Overwrite])
+    # db_bench reads at random twice before the rest, to let compactions from the writes quiesce.
+    var warm: Measure
+    reads(&s, ReadRandom, num, &warm)
+    reads(&s, ReadRandom, num, &r.steps[ReadRandom])
+    scans(&s, ReadSeq, true, &r.steps[ReadSeq])
+    scans(&s, ReadReverse, false, &r.steps[ReadReverse])
+    let t = now_ns()
+    s.compact()
+    r.steps[Compact] = Measure(ran: true, ops: 1, ns: now_ns() - t)
+    report(Compact, &r.steps[Compact])
+    reads(&s, ReadRandomAfter, num, &r.steps[ReadRandomAfter])
+    scans(&s, ReadSeqAfter, true, &r.steps[ReadSeqAfter])
+    scans(&s, ReadReverseAfter, false, &r.steps[ReadReverseAfter])
+    s.close()
+    if s.failed: print("{kind_name(kind)}: a write failed")
+    if kind == SnailDb: s.db.release()
+    s.folder.free()
+    s.values.free()
+    s.out.free()
+    r.ran = not s.failed
+
+fn main()
+    let num = arg_count() > 1 ? parse_int(arg(1)) : 1000000
+    let at = arg_count() > 2 ? arg(2) : "../../build/dbbench"
+    sn_db_make_folder(at.ptr, at.len as int)
+    var wanted: [Stores]bool
+    for i in 0..Stores: wanted[i] = arg_count() <= 3
+    for a in 3..arg_count()
+        for i in 0..Stores
+            if arg(a) == kind_folder(i as Kind): wanted[i] = true
+    print("{num} entries of {KeyBytes}-byte keys and {ValueBytes}-byte values, LevelDB {leveldb_major_version()}.{leveldb_minor_version()}")
+    var results: [Stores]Result
+    var first = true
+    for i in 0..Stores
+        if not wanted[i]: continue
+        # A pause between stores, for the system to write out what the last one left in its cache.
+        if not first: sleep_ms(PauseMs)
+        first = false
+        run(i as Kind, at, num, &results[i])
+    let r = results[0..Stores]
+    var sync_title: [..]u8
+    var sync_ops: [..]u8
+    defer sync_title.free()
+    defer sync_ops.free()
+    db_add(&sync_title, "fillsync, ")
+    db_add(&sync_title, number(&sync_ops, (num / 1000) as f64, 0))
+    db_add(&sync_title, " ops")
+    print("")
+    header(r)
+    row("fillseq", r, FillSeq)
+    row(str(sync_title[0..sync_title.len]), r, FillSync)
+    row("fillrandom", r, FillRandom)
+    row("overwrite", r, Overwrite)
+    print("")
+    header(r)
+    row("readrandom", r, ReadRandom)
+    row("readseq", r, ReadSeq)
+    row("readreverse", r, ReadReverse)
+    row("compact", r, Compact)
+    row("readrandom, compacted", r, ReadRandomAfter)
+    row("readseq, compacted", r, ReadSeqAfter)
+    row("readreverse, compacted", r, ReadReverseAfter)
